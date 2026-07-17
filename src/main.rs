@@ -13,22 +13,16 @@ fn main() -> Result<(), String> {
     let community_size = USER_COUNT / COMMUNITY_COUNT;
 
     println!("Building the reference graph...");
-
     let reference = build_reference_graph()?;
 
     println!("Building hash-placed graph...");
-
     let hash_graph = build_sharded_graph(Placement::Hash)?;
 
     println!("Building community-placed graph...\n");
-
     let community_graph = build_sharded_graph(Placement::Community { community_size })?;
 
-    println!("Hash users per shard:");
-    println!("{:?}\n", hash_graph.users_per_shard());
-
-    println!("Community users per shard:");
-    println!("{:?}\n", community_graph.users_per_shard());
+    print_distribution("Hash", &hash_graph);
+    print_distribution("Community", &community_graph);
 
     let hash_stats = validate_and_measure("Hash", &reference, &hash_graph)?;
 
@@ -73,7 +67,6 @@ fn validate_and_measure(
 
     for source in 1..=QUERY_COUNT {
         let mut expected = reference.get_two_hop_ids(source);
-
         let result = sharded.get_two_hop_with_stats(source);
 
         validate_result(source, &mut expected, &result)?;
@@ -140,6 +133,40 @@ fn percentage_reduction(before: f64, after: f64) -> f64 {
     }
 
     ((before - after) / before) * 100.0
+}
+
+fn imbalance_percentage(values: &[usize]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+
+    let total: usize = values.iter().sum();
+    let average = total as f64 / values.len() as f64;
+    let maximum = *values.iter().max().unwrap() as f64;
+
+    if average == 0.0 {
+        return 0.0;
+    }
+
+    ((maximum - average) / average) * 100.0
+}
+
+fn print_distribution(label: &str, graph: &ShardedGraph) {
+    let users = graph.users_per_shard();
+    let edges = graph.edges_per_shard();
+
+    println!("{label} users per shard: {users:?}");
+    println!("{label} edges per shard: {edges:?}");
+
+    println!(
+        "{label} user imbalance: {:.2}%",
+        imbalance_percentage(&users)
+    );
+
+    println!(
+        "{label} edge imbalance: {:.2}%\n",
+        imbalance_percentage(&edges)
+    );
 }
 
 fn build_reference_graph() -> Result<Graph, String> {

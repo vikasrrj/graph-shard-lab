@@ -24,6 +24,13 @@ impl ShardedGraph {
     pub fn new(shard_count: usize) -> Result<Self, String> {
         Self::with_placement(shard_count, Placement::Hash)
     }
+    pub fn edges_per_shard(&self) -> Vec<usize> {
+        self.shards.iter().map(Graph::edge_count).collect()
+    }
+
+    pub fn placement_for_user(&self, user_id: u64) -> usize {
+        self.shard_for(user_id)
+    }
 
     pub fn with_placement(shard_count: usize, placement: Placement) -> Result<Self, String> {
         if shard_count == 0 {
