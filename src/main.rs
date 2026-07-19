@@ -1,3 +1,8 @@
+use std::{
+    fs::{File, create_dir_all},
+    io::{BufWriter, Write},
+};
+
 use graph_shard_lab::{
     Graph,
     sharded::{Placement, QueryResult, ShardedGraph},
@@ -32,7 +37,19 @@ fn main() -> Result<(), String> {
 
     println!("{}", "-".repeat(72));
 
+    let mut csv_rows = Vec::new();
+
+    csv_rows.push(
+        "local_edges,hash_hops,community_hops,reduction_percent,community_shards".to_string(),
+    );
+
     for local_edges_per_user in LOCAL_EDGE_COUNTS {
+        /*
+        Generate one edge list.
+
+        The normal graph, hash graph, and community graph all receive
+        this exact same list, so the comparison is fair.
+        */
         let workload = generate_community_workload(
             USER_COUNT,
             COMMUNITY_COUNT,
@@ -65,8 +82,25 @@ fn main() -> Result<(), String> {
             reduction,
             community_stats.average_shards_touched
         );
+
+        csv_rows.push(format!(
+            "{},{:.2},{:.2},{:.2},{:.2}",
+            local_edges_per_user,
+            hash_stats.average_cross_shard_hops,
+            community_stats.average_cross_shard_hops,
+            reduction,
+            community_stats.average_shards_touched
+        ));
     }
 
+    write_csv("results/locality_sweep.csv", &csv_rows)?;
+
+    println!("\nSaved results to results/locality_sweep.csv");
+
+    /*
+    Build one representative community-placed graph so we can inspect
+    how unevenly users and edges are distributed across shards.
+    */
     let example_workload =
         generate_community_workload(USER_COUNT, COMMUNITY_COUNT, EDGES_PER_USER, 7, SEED)?;
 
@@ -101,7 +135,9 @@ struct AggregateStats {
 fn build_reference_graph(workload: &CommunityWorkload) -> Result<Graph, String> {
     let mut graph = Graph::new();
 
-    add_users_to_normal_graph(&mut graph, workload.user_count)?;
+    for id in 1..=workload.user_count {
+        graph.add_user(id, &format!("user-{id}"))?;
+    }
 
     for &(source, target) in &workload.edges {
         graph.add_follow(source, target)?;
@@ -125,14 +161,6 @@ fn build_sharded_graph(
     }
 
     Ok(graph)
-}
-
-fn add_users_to_normal_graph(graph: &mut Graph, user_count: u64) -> Result<(), String> {
-    for id in 1..=user_count {
-        graph.add_user(id, &format!("user-{id}"))?;
-    }
-
-    Ok(())
 }
 
 fn validate_and_measure(
@@ -198,4 +226,23 @@ fn imbalance_percentage(values: &[usize]) -> f64 {
     }
 
     ((maximum - average) / average) * 100.0
+}
+
+fn write_csv(path: &str, rows: &[String]) -> Result<(), String> {
+    create_dir_all("results")
+        .map_err(|error| format!("Failed to create results directory: {error}"))?;
+
+    let file = File::create(path).map_err(|error| format!("Failed to create CSV file: {error}"))?;
+
+    let mut writer = BufWriter::new(file);
+
+    for row in rows {
+        writeln!(writer, "{row}").map_err(|error| format!("Failed to write CSV row: {error}"))?;
+    }
+
+    writer
+        .flush()
+        .map_err(|error| format!("Failed to finish CSV file: {error}"))?;
+
+    Ok(())
 }
