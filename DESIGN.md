@@ -1,19 +1,17 @@
 # GraphShard Lab Design
 
-## Goal
+## Scope
 
-GraphShard Lab compares different ways of placing graph data across logical shards.
+GraphShard Lab is an in-memory Rust research prototype.
 
-The main trade-off is:
+It models graph data distributed across logical shards and compares data-placement strategies using synthetic workloads.
 
-- balanced shards;
-- fewer cross-shard graph traversals.
+The project focuses on placement behavior, query correctness, locality, and shard balance. It does not attempt to implement storage durability, networking, replication, consensus, or production query execution.
 
-## Graph model
+## Data model
 
-Users are graph nodes.
-
-A directed `FOLLOWS` relationship is an edge:
+The graph contains users and directed follow relationships.
 
 ```text
 User 1 → User 2
+

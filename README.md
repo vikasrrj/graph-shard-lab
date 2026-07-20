@@ -1,23 +1,22 @@
+# GraphShard Lab
 
----
+GraphShard Lab is a Rust research prototype for comparing graph data-placement strategies and measuring the trade-off between shard balance and cross-shard traversal.
 
-## 2. Create `DESIGN.md`
+It answers one question:
 
-```bash
-cat > DESIGN.md <<'EOF'
-# GraphShard Lab Design
+> How should a graph database distribute connected users across shards?
 
-## Scope
+The project compares three strategies:
 
-GraphShard Lab is an in-memory Rust research prototype.
+- **Hash placement** — spreads users evenly but ignores relationships.
+- **Naive community placement** — keeps connected communities together but may overload shards.
+- **Balanced community placement** — keeps communities together while assigning them to the least-loaded shards.
 
-It models graph data distributed across logical shards and compares data-placement strategies using synthetic workloads.
+## Why this matters
 
-The project focuses on placement behavior, query correctness, locality, and shard balance. It does not attempt to implement storage durability, networking, replication, consensus, or production query execution.
+Graph queries frequently follow relationships between nodes.
 
-## Data model
-
-The graph contains users and directed follow relationships.
+For example:
 
 ```text
-User 1 → User 2
+Alice → Bob → Charlie
