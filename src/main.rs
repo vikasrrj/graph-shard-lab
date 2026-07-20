@@ -199,9 +199,8 @@ fn run_uneven_community_benchmark() -> Result<(), String> {
     let naive_stats = validate_and_measure(&reference, &naive_graph, workload.user_count)?;
 
     let balanced_stats = validate_and_measure(&reference, &balanced_graph, workload.user_count)?;
-
     println!(
-        "{:<22} {:<28} {:<14} {:<14}",
+        "{:<22} {:<28} {:>14} {:>14}",
         "Strategy", "Users per shard", "User imbalance", "Average hops"
     );
 
@@ -340,14 +339,14 @@ fn validate_result(
 
     Ok(())
 }
-
 fn print_strategy_result(name: &str, graph: &ShardedGraph, stats: &AggregateStats) {
     let users = graph.users_per_shard();
+    let users_text = format!("{users:?}");
 
     println!(
-        "{:<22} {:<28?} {:<13.2}% {:<14.2}",
+        "{:<22} {:<28} {:>13.2}% {:>14.2}",
         name,
-        users,
+        users_text,
         imbalance_percentage(&users),
         stats.average_cross_shard_hops
     );
