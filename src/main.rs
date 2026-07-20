@@ -42,11 +42,18 @@ fn run_locality_sweep() -> Result<(), String> {
     );
 
     println!(
-        "{:<12} {:<12} {:<16} {:<12} {:<16}",
-        "Local edges", "Hash hops", "Community hops", "Reduction", "Community shards"
+        "{:<12} {:<12} {:<16} {:<12} {:<16} {:<12} {:<13} {:>13}",
+        "Local edges",
+        "Hash hops",
+        "Community hops",
+        "Reduction",
+        "Community shards",
+        "Direct reqs",
+        "Batched reqs",
+        "Req reduction",
     );
 
-    println!("{}", "-".repeat(72));
+    println!("{}", "-".repeat(124));
 
     let mut csv_rows = Vec::new();
 
@@ -85,21 +92,27 @@ fn run_locality_sweep() -> Result<(), String> {
         let reduction_text = format!("{reduction:.2}%");
 
         println!(
-            "{:<12} {:<12.2} {:<16.2} {:<12} {:<16.2}",
+            "{:<12} {:<12.2} {:<16.2} {:<12} {:<16.2} {:<12.2} {:<13.2} {:>12.2}%",
             local_edges_per_user,
             hash_stats.average_cross_shard_hops,
             community_stats.average_cross_shard_hops,
             reduction_text,
-            community_stats.average_shards_touched
+            community_stats.average_shards_touched,
+            community_stats.average_direct_shard_requests,
+            community_stats.average_batched_shard_requests,
+            community_stats.request_reduction_percent,
         );
 
         csv_rows.push(format!(
-            "{},{:.2},{:.2},{:.2},{:.2}",
+            "{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
             local_edges_per_user,
             hash_stats.average_cross_shard_hops,
             community_stats.average_cross_shard_hops,
             reduction,
-            community_stats.average_shards_touched
+            community_stats.average_shards_touched,
+            community_stats.average_direct_shard_requests,
+            community_stats.average_batched_shard_requests,
+            community_stats.request_reduction_percent,
         ));
     }
 
@@ -202,11 +215,17 @@ fn run_uneven_community_benchmark() -> Result<(), String> {
 
     let balanced_stats = validate_and_measure(&reference, &balanced_graph, workload.user_count)?;
     println!(
-        "{:<22} {:<28} {:>14} {:>14}",
-        "Strategy", "Users per shard", "User imbalance", "Average hops"
+        "{:<22} {:<28} {:>14} {:>14} {:>12} {:>12} {:>13}",
+        "Strategy",
+        "Users per shard",
+        "User imbalance",
+        "Average hops",
+        "Direct reqs",
+        "Batched reqs",
+        "Req reduction",
     );
 
-    println!("{}", "-".repeat(82));
+    println!("{}", "-".repeat(126));
 
     print_strategy_result("Hash", &hash_graph, &hash_stats);
 
@@ -245,6 +264,9 @@ fn run_uneven_community_benchmark() -> Result<(), String> {
 struct AggregateStats {
     average_shards_touched: f64,
     average_cross_shard_hops: f64,
+    average_direct_shard_requests: f64,
+    average_batched_shard_requests: f64,
+    request_reduction_percent: f64,
 }
 
 fn build_reference_graph(workload: &CommunityWorkload) -> Result<Graph, String> {
@@ -305,23 +327,42 @@ fn validate_and_measure(
 ) -> Result<AggregateStats, String> {
     let mut total_shards_touched = 0_usize;
     let mut total_cross_shard_hops = 0_usize;
+    let mut total_direct_shard_requests = 0_usize;
+    let mut total_batched_shard_requests = 0_usize;
 
     for source in 1..=query_count {
         let mut expected = reference.get_two_hop_ids(source);
 
-        let actual = sharded.get_two_hop_with_stats(source);
+        let direct = sharded.get_two_hop_with_stats(source);
+        validate_result(source, &mut expected, &direct)?;
 
-        validate_result(source, &mut expected, &actual)?;
+        let batched = sharded.get_two_hop_batched_with_stats(source);
+        validate_result(source, &mut expected, &batched)?;
 
-        total_shards_touched += actual.shards_touched;
-
-        total_cross_shard_hops += actual.cross_shard_hops;
+        total_shards_touched += direct.shards_touched;
+        total_cross_shard_hops += direct.cross_shard_hops;
+        total_direct_shard_requests += direct.shard_requests;
+        total_batched_shard_requests += batched.shard_requests;
     }
+
+    let average_direct_shard_requests = total_direct_shard_requests as f64 / query_count as f64;
+
+    let average_batched_shard_requests = total_batched_shard_requests as f64 / query_count as f64;
+
+    let request_reduction_percent = if average_direct_shard_requests == 0.0 {
+        0.0
+    } else {
+        (average_direct_shard_requests - average_batched_shard_requests)
+            / average_direct_shard_requests
+            * 100.0
+    };
 
     Ok(AggregateStats {
         average_shards_touched: total_shards_touched as f64 / query_count as f64,
-
         average_cross_shard_hops: total_cross_shard_hops as f64 / query_count as f64,
+        average_direct_shard_requests,
+        average_batched_shard_requests,
+        request_reduction_percent,
     })
 }
 
@@ -346,11 +387,14 @@ fn print_strategy_result(name: &str, graph: &ShardedGraph, stats: &AggregateStat
     let users_text = format!("{users:?}");
 
     println!(
-        "{:<22} {:<28} {:>13.2}% {:>14.2}",
+        "{:<22} {:<28} {:>13.2}% {:>14.2} {:>12.2} {:>12.2} {:>12.2}%",
         name,
         users_text,
         imbalance_percentage(&users),
-        stats.average_cross_shard_hops
+        stats.average_cross_shard_hops,
+        stats.average_direct_shard_requests,
+        stats.average_batched_shard_requests,
+        stats.request_reduction_percent,
     );
 }
 
