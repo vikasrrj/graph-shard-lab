@@ -48,7 +48,7 @@ These are logical request counts inside an in-process prototype, not measured ne
 
 Community sizes:
 
-```text
+''' text
 [4000, 2500, 1500, 1000, 1000]
 
 | Strategy           | Users per shard            | Maximum imbalance | Average hops | Batched request reduction |
