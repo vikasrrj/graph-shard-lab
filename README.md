@@ -27,6 +27,23 @@ Community placement produced **86.19% fewer logical cross-shard hops** in this s
 
 ![Community strength versus cross-shard traversal](docs/images/locality_sweep.svg)
 
+
+
+### Batched query execution
+
+The project also compares two ways of running the same two-hop query:
+
+- **Direct execution** reads each first-hop user separately.
+- **Batched execution** groups first-hop users by shard.
+
+Direct execution used 9 logical shard requests per query.
+
+Batched execution used between 2.00 and 4.52 requests, reducing logical shard requests by **49.74% to 77.78%** while returning the same query results.
+
+![Direct versus batched shard requests](docs/images/batching_requests.svg)
+
+These are logical request counts inside an in-process prototype, not measured network latency.
+
 ### Uneven-community workload
 
 Community sizes:
@@ -34,11 +51,11 @@ Community sizes:
 ```text
 [4000, 2500, 1500, 1000, 1000]
 
-| Strategy           | Users per shard            | Maximum imbalance | Average hops |
-| ------------------ | -------------------------- | ----------------: | -----------: |
-| Hash               | `[2500, 2500, 2500, 2500]` |                0% |        53.97 |
-| Naive community    | `[5000, 2500, 1500, 1000]` |              100% |         8.02 |
-| Balanced community | `[4000, 2500, 1500, 2000]` |               60% |         8.79 |
+| Strategy           | Users per shard            | Maximum imbalance | Average hops | Batched request reduction |
+| ------------------ | -------------------------- | ----------------: | -----------: | ------------------------: |
+| Hash               | `[2500, 2500, 2500, 2500]` |                0% |        53.97 |                    48.84% |
+| Naive community    | `[5000, 2500, 1500, 1000]` |              100% |         8.02 |                    67.91% |
+| Balanced community | `[4000, 2500, 1500, 2000]` |               60% |         8.79 |                    66.93% |
 
 Balanced community placement reduced the naive strategy’s maximum imbalance from 100% to 60%, while retaining most of its locality advantage.
 
@@ -46,6 +63,23 @@ The remaining imbalance cannot be removed without splitting the largest 4,000-us
 
 What it measures
 
+This also fixes the currently unclosed code block around the community sizes.
+
+## 3. Generate and verify
+
+Run:
+
+```bash
+python scripts/generate_charts.py
+
+ls docs/images
+grep -n "Batched query execution" README.md
+grep -n "What it measures" README.md
+git diff --check
+
+You should see:
+
+docs/images/batching_requests.svg
 For each two-hop query, GraphShard Lab records:
 
 logical cross-shard hops;

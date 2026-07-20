@@ -23,9 +23,7 @@ def generate_locality_chart() -> None:
     rows = read_csv(RESULTS_DIR / "locality_sweep.csv")
 
     local_edges = [int(row["local_edges"]) for row in rows]
-
     hash_hops = [float(row["hash_hops"]) for row in rows]
-
     community_hops = [float(row["community_hops"]) for row in rows]
 
     plt.figure(figsize=(9, 5.5))
@@ -45,9 +43,7 @@ def generate_locality_chart() -> None:
     )
 
     plt.title("Community Strength vs Cross-Shard Traversal")
-
     plt.xlabel("Local edges per user out of 8 total edges")
-
     plt.ylabel("Average cross-shard hops per two-hop query")
 
     plt.xticks(local_edges)
@@ -56,6 +52,48 @@ def generate_locality_chart() -> None:
     plt.tight_layout()
 
     output_path = IMAGES_DIR / "locality_sweep.svg"
+
+    plt.savefig(output_path, format="svg")
+    plt.close()
+
+    print(f"Created {output_path}")
+
+
+def generate_batching_chart() -> None:
+    rows = read_csv(RESULTS_DIR / "locality_sweep.csv")
+
+    local_edges = [int(row["local_edges"]) for row in rows]
+
+    direct_requests = [float(row["direct_shard_requests"]) for row in rows]
+
+    batched_requests = [float(row["batched_shard_requests"]) for row in rows]
+
+    plt.figure(figsize=(9, 5.5))
+
+    plt.plot(
+        local_edges,
+        direct_requests,
+        marker="o",
+        label="Direct execution",
+    )
+
+    plt.plot(
+        local_edges,
+        batched_requests,
+        marker="o",
+        label="Batched execution",
+    )
+
+    plt.title("Direct vs Batched Shard Requests")
+    plt.xlabel("Local edges per user out of 8 total edges")
+    plt.ylabel("Average logical shard requests per query")
+
+    plt.xticks(local_edges)
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    output_path = IMAGES_DIR / "batching_requests.svg"
 
     plt.savefig(output_path, format="svg")
     plt.close()
@@ -109,9 +147,7 @@ def generate_tradeoff_chart() -> None:
         )
 
     plt.title("Shard Balance vs Graph Locality")
-
     plt.xlabel("Maximum user imbalance (%)")
-
     plt.ylabel("Average cross-shard hops per two-hop query")
 
     plt.grid(alpha=0.3)
@@ -132,6 +168,7 @@ def main() -> None:
     )
 
     generate_locality_chart()
+    generate_batching_chart()
     generate_tradeoff_chart()
 
 
