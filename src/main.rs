@@ -82,12 +82,14 @@ fn run_locality_sweep() -> Result<(), String> {
             community_stats.average_cross_shard_hops,
         );
 
+        let reduction_text = format!("{reduction:.2}%");
+
         println!(
-            "{:<12} {:<12.2} {:<16.2} {:<11.2}% {:<16.2}",
+            "{:<12} {:<12.2} {:<16.2} {:<12} {:<16.2}",
             local_edges_per_user,
             hash_stats.average_cross_shard_hops,
             community_stats.average_cross_shard_hops,
-            reduction,
+            reduction_text,
             community_stats.average_shards_touched
         );
 
