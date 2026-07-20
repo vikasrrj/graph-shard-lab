@@ -72,10 +72,8 @@ Run:
 ```bash
 python scripts/generate_charts.py
 
-ls docs/images
-grep -n "Batched query execution" README.md
-grep -n "What it measures" README.md
-git diff --check
+
+
 
 You should see:
 
