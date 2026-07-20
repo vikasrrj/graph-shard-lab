@@ -1,4 +1,6 @@
+pub mod balanced;
 pub mod sharded;
+pub mod uneven;
 pub mod workload;
 
 use std::collections::{HashMap, HashSet};

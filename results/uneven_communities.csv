@@ -1,0 +1,4 @@
+strategy,average_cross_shard_hops,average_shards_touched,user_imbalance_percent,edge_imbalance_percent
+hash,53.97,4.00,0.00,0.00
+naive_community,8.02,3.65,100.00,100.00
+balanced_community,8.79,3.84,60.00,60.00

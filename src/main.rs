@@ -6,6 +6,7 @@ use std::{
 use graph_shard_lab::{
     Graph,
     sharded::{Placement, QueryResult, ShardedGraph},
+    uneven::generate_uneven_community_workload,
     workload::{CommunityWorkload, generate_community_workload},
 };
 
@@ -13,12 +14,22 @@ const USER_COUNT: u64 = 10_000;
 const COMMUNITY_COUNT: u64 = 10;
 const EDGES_PER_USER: u64 = 8;
 const SHARD_COUNT: usize = 4;
-const QUERY_COUNT: u64 = 10_000;
 const SEED: u64 = 42;
 
 const LOCAL_EDGE_COUNTS: [u64; 6] = [0, 2, 4, 6, 7, 8];
 
+const UNEVEN_COMMUNITY_SIZES: [u64; 5] = [4_000, 2_500, 1_500, 1_000, 1_000];
+
+const UNEVEN_LOCAL_EDGES: u64 = 7;
+
 fn main() -> Result<(), String> {
+    run_locality_sweep()?;
+    run_uneven_community_benchmark()?;
+
+    Ok(())
+}
+
+fn run_locality_sweep() -> Result<(), String> {
     let community_size = USER_COUNT / COMMUNITY_COUNT;
 
     println!(
@@ -40,16 +51,12 @@ fn main() -> Result<(), String> {
     let mut csv_rows = Vec::new();
 
     csv_rows.push(
-        "local_edges,hash_hops,community_hops,reduction_percent,community_shards".to_string(),
+        "local_edges,hash_hops,community_hops,\
+         reduction_percent,community_shards"
+            .replace(' ', ""),
     );
 
     for local_edges_per_user in LOCAL_EDGE_COUNTS {
-        /*
-        Generate one edge list.
-
-        The normal graph, hash graph, and community graph all receive
-        this exact same list, so the comparison is fair.
-        */
         let workload = generate_community_workload(
             USER_COUNT,
             COMMUNITY_COUNT,
@@ -65,9 +72,10 @@ fn main() -> Result<(), String> {
         let community_graph =
             build_sharded_graph(&workload, Placement::Community { community_size })?;
 
-        let hash_stats = validate_and_measure(&reference, &hash_graph)?;
+        let hash_stats = validate_and_measure(&reference, &hash_graph, workload.user_count)?;
 
-        let community_stats = validate_and_measure(&reference, &community_graph)?;
+        let community_stats =
+            validate_and_measure(&reference, &community_graph, workload.user_count)?;
 
         let reduction = percentage_reduction(
             hash_stats.average_cross_shard_hops,
@@ -97,10 +105,6 @@ fn main() -> Result<(), String> {
 
     println!("\nSaved results to results/locality_sweep.csv");
 
-    /*
-    Build one representative community-placed graph so we can inspect
-    how unevenly users and edges are distributed across shards.
-    */
     let example_workload =
         generate_community_workload(USER_COUNT, COMMUNITY_COUNT, EDGES_PER_USER, 7, SEED)?;
 
@@ -122,6 +126,116 @@ fn main() -> Result<(), String> {
     println!(
         "Maximum edge imbalance: {:.2}%",
         imbalance_percentage(&edges)
+    );
+
+    Ok(())
+}
+
+fn run_uneven_community_benchmark() -> Result<(), String> {
+    println!("\n");
+    println!("Uneven community benchmark");
+    println!("Community sizes: {:?}", UNEVEN_COMMUNITY_SIZES);
+    println!("Edges per user: {EDGES_PER_USER}");
+    println!("Local edges per user: {UNEVEN_LOCAL_EDGES}");
+    println!("Shards: {SHARD_COUNT}");
+    println!("Seed: {SEED}\n");
+
+    let workload = generate_uneven_community_workload(
+        &UNEVEN_COMMUNITY_SIZES,
+        EDGES_PER_USER,
+        UNEVEN_LOCAL_EDGES,
+        SEED,
+    )?;
+
+    /*
+    The reference graph is not sharded.
+
+    It tells us the correct query answers.
+    */
+    let reference = build_reference_graph(&workload)?;
+
+    /*
+    Strategy 1: Hash placement.
+
+    Users are spread according to their IDs.
+    */
+    let hash_graph = build_sharded_graph(&workload, Placement::Hash)?;
+
+    /*
+    Strategy 2: Naive community placement.
+
+    Communities are assigned in repeating order:
+
+    community 0 -> shard 0
+    community 1 -> shard 1
+    community 2 -> shard 2
+    community 3 -> shard 3
+    community 4 -> shard 0
+    */
+    let naive_assignment: Vec<usize> = (0..UNEVEN_COMMUNITY_SIZES.len())
+        .map(|community_id| community_id % SHARD_COUNT)
+        .collect();
+
+    let naive_graph = build_sharded_graph(
+        &workload,
+        Placement::BalancedCommunity {
+            community_sizes: UNEVEN_COMMUNITY_SIZES.to_vec(),
+
+            community_to_shard: naive_assignment,
+        },
+    )?;
+
+    /*
+    Strategy 3: Balanced community placement.
+
+    The largest communities are placed first.
+    Every next community goes to the shard with
+    the fewest users.
+    */
+    let balanced_graph = build_balanced_graph(&workload, UNEVEN_COMMUNITY_SIZES.to_vec())?;
+
+    let hash_stats = validate_and_measure(&reference, &hash_graph, workload.user_count)?;
+
+    let naive_stats = validate_and_measure(&reference, &naive_graph, workload.user_count)?;
+
+    let balanced_stats = validate_and_measure(&reference, &balanced_graph, workload.user_count)?;
+
+    println!(
+        "{:<22} {:<28} {:<14} {:<14}",
+        "Strategy", "Users per shard", "User imbalance", "Average hops"
+    );
+
+    println!("{}", "-".repeat(82));
+
+    print_strategy_result("Hash", &hash_graph, &hash_stats);
+
+    print_strategy_result("Naive community", &naive_graph, &naive_stats);
+
+    print_strategy_result("Balanced community", &balanced_graph, &balanced_stats);
+
+    println!("\nEdge distribution:");
+
+    println!("Hash:               {:?}", hash_graph.edges_per_shard());
+
+    println!("Naive community:    {:?}", naive_graph.edges_per_shard());
+
+    println!("Balanced community: {:?}", balanced_graph.edges_per_shard());
+
+    let csv_rows = vec![
+        "strategy,average_cross_shard_hops,\
+         average_shards_touched,user_imbalance_percent,\
+         edge_imbalance_percent"
+            .replace(' ', ""),
+        strategy_csv_row("hash", &hash_graph, &hash_stats),
+        strategy_csv_row("naive_community", &naive_graph, &naive_stats),
+        strategy_csv_row("balanced_community", &balanced_graph, &balanced_stats),
+    ];
+
+    write_csv("results/uneven_communities.csv", &csv_rows)?;
+
+    println!(
+        "\nSaved results to \
+         results/uneven_communities.csv"
     );
 
     Ok(())
@@ -152,6 +266,26 @@ fn build_sharded_graph(
 ) -> Result<ShardedGraph, String> {
     let mut graph = ShardedGraph::with_placement(SHARD_COUNT, placement)?;
 
+    populate_sharded_graph(&mut graph, workload)?;
+
+    Ok(graph)
+}
+
+fn build_balanced_graph(
+    workload: &CommunityWorkload,
+    community_sizes: Vec<u64>,
+) -> Result<ShardedGraph, String> {
+    let mut graph = ShardedGraph::with_balanced_communities(SHARD_COUNT, community_sizes)?;
+
+    populate_sharded_graph(&mut graph, workload)?;
+
+    Ok(graph)
+}
+
+fn populate_sharded_graph(
+    graph: &mut ShardedGraph,
+    workload: &CommunityWorkload,
+) -> Result<(), String> {
     for id in 1..=workload.user_count {
         graph.add_user(id, &format!("user-{id}"))?;
     }
@@ -160,30 +294,33 @@ fn build_sharded_graph(
         graph.add_follow(source, target)?;
     }
 
-    Ok(graph)
+    Ok(())
 }
 
 fn validate_and_measure(
     reference: &Graph,
     sharded: &ShardedGraph,
+    query_count: u64,
 ) -> Result<AggregateStats, String> {
     let mut total_shards_touched = 0_usize;
     let mut total_cross_shard_hops = 0_usize;
 
-    for source in 1..=QUERY_COUNT {
+    for source in 1..=query_count {
         let mut expected = reference.get_two_hop_ids(source);
+
         let actual = sharded.get_two_hop_with_stats(source);
 
         validate_result(source, &mut expected, &actual)?;
 
         total_shards_touched += actual.shards_touched;
+
         total_cross_shard_hops += actual.cross_shard_hops;
     }
 
     Ok(AggregateStats {
-        average_shards_touched: total_shards_touched as f64 / QUERY_COUNT as f64,
+        average_shards_touched: total_shards_touched as f64 / query_count as f64,
 
-        average_cross_shard_hops: total_cross_shard_hops as f64 / QUERY_COUNT as f64,
+        average_cross_shard_hops: total_cross_shard_hops as f64 / query_count as f64,
     })
 }
 
@@ -204,6 +341,32 @@ fn validate_result(
     Ok(())
 }
 
+fn print_strategy_result(name: &str, graph: &ShardedGraph, stats: &AggregateStats) {
+    let users = graph.users_per_shard();
+
+    println!(
+        "{:<22} {:<28?} {:<13.2}% {:<14.2}",
+        name,
+        users,
+        imbalance_percentage(&users),
+        stats.average_cross_shard_hops
+    );
+}
+
+fn strategy_csv_row(name: &str, graph: &ShardedGraph, stats: &AggregateStats) -> String {
+    let users = graph.users_per_shard();
+    let edges = graph.edges_per_shard();
+
+    format!(
+        "{},{:.2},{:.2},{:.2},{:.2}",
+        name,
+        stats.average_cross_shard_hops,
+        stats.average_shards_touched,
+        imbalance_percentage(&users),
+        imbalance_percentage(&edges)
+    )
+}
+
 fn percentage_reduction(before: f64, after: f64) -> f64 {
     if before == 0.0 {
         return 0.0;
@@ -218,7 +381,9 @@ fn imbalance_percentage(values: &[usize]) -> f64 {
     }
 
     let total: usize = values.iter().sum();
+
     let average = total as f64 / values.len() as f64;
+
     let maximum = *values.iter().max().unwrap() as f64;
 
     if average == 0.0 {
