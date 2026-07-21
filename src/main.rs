@@ -43,6 +43,7 @@ fn main() -> Result<(), String> {
     run_hotspot_cache_baseline()?;
     run_hotspot_cache_warming_benchmark()?;
     run_real_sharded_cache_benchmark()?;
+    run_real_sharded_cache_warming_benchmark()?;
 
     Ok(())
 }
@@ -286,6 +287,14 @@ struct CacheRunStats {
     misses: u64,
     startup_hits: u64,
     startup_accesses: u64,
+}
+
+#[derive(Debug)]
+struct RealCacheRunStats {
+    hits: usize,
+    misses: usize,
+    startup_hits: usize,
+    startup_misses: usize,
 }
 
 struct AggregateStats {
@@ -901,6 +910,182 @@ fn run_real_sharded_cache_benchmark() -> Result<(), String> {
     println!(
         "\nSaved results to \
          results/real_sharded_cache.csv"
+    );
+
+    Ok(())
+}
+
+fn run_real_cached_queries(
+    reference: &Graph,
+    sharded: &mut ShardedGraph,
+    query_count: u64,
+) -> Result<RealCacheRunStats, String> {
+    if CACHE_STARTUP_WINDOW as u64 % EDGES_PER_USER != 0 {
+        return Err("Startup window must divide evenly by edges per user".to_string());
+    }
+
+    let startup_query_count = CACHE_STARTUP_WINDOW as u64 / EDGES_PER_USER;
+
+    let mut hits = 0_usize;
+    let mut misses = 0_usize;
+
+    let mut startup_hits = 0_usize;
+    let mut startup_misses = 0_usize;
+
+    for source in 1..=query_count {
+        let mut expected = reference.get_two_hop_ids(source);
+
+        let cached = sharded.get_two_hop_with_cache_stats(source)?;
+
+        let mut actual = cached.user_ids;
+
+        expected.sort_unstable();
+        actual.sort_unstable();
+
+        if actual != expected {
+            return Err(format!(
+                "Cached query returned incorrect users for source {source}"
+            ));
+        }
+
+        hits += cached.cache_hits;
+        misses += cached.cache_misses;
+
+        /*
+        Every query has exactly eight first-hop adjacency accesses.
+
+        1,000 accesses / 8 accesses per query
+        = first 125 queries.
+        */
+        if source <= startup_query_count {
+            startup_hits += cached.cache_hits;
+            startup_misses += cached.cache_misses;
+        }
+    }
+
+    Ok(RealCacheRunStats {
+        hits,
+        misses,
+        startup_hits,
+        startup_misses,
+    })
+}
+
+fn run_real_sharded_cache_warming_benchmark() -> Result<(), String> {
+    let workload = generate_hub_workload(
+        USER_COUNT,
+        HUB_COUNT,
+        EDGES_PER_USER,
+        HUB_EDGES_PER_USER,
+        SEED,
+    )?;
+
+    let reference = build_hub_reference_graph(&workload)?;
+
+    let mut hub_read_counts = vec![0_u64; (HUB_COUNT + 1) as usize];
+
+    for &(_, target) in &workload.edges {
+        if target <= HUB_COUNT {
+            hub_read_counts[target as usize] += 1;
+        }
+    }
+
+    let mut ranked_hubs: Vec<u64> = (1..=HUB_COUNT).collect();
+
+    ranked_hubs.sort_by(|left, right| {
+        hub_read_counts[*right as usize]
+            .cmp(&hub_read_counts[*left as usize])
+            .then_with(|| left.cmp(right))
+    });
+
+    println!(
+        "\nReal per-shard cache warming benchmark\n\
+         Shards: {SHARD_COUNT}\n\
+         Hubs preloaded: {HUB_COUNT}\n\
+         Startup window: first {CACHE_STARTUP_WINDOW} accesses\n"
+    );
+
+    println!(
+        "{:<12} {:<13} {:<13} {:<16} {:<16}",
+        "Per shard", "Cold total", "Warm total", "Cold first 1k", "Warm first 1k",
+    );
+
+    println!("{}", "-".repeat(78));
+
+    let mut csv_rows = vec![
+        "cache_capacity_per_shard,total_cache_capacity,\
+         preloaded_hubs,cold_hits,cold_misses,warmed_hits,\
+         warmed_misses,cold_hit_rate_percent,\
+         warmed_hit_rate_percent,\
+         cold_startup_hit_rate_percent,\
+         warmed_startup_hit_rate_percent"
+            .replace(' ', ""),
+    ];
+
+    for capacity_per_shard in REAL_CACHE_CAPACITIES_PER_SHARD {
+        let mut cold_graph = build_cached_hub_sharded_graph(&workload, capacity_per_shard)?;
+
+        let cold = run_real_cached_queries(&reference, &mut cold_graph, workload.user_count)?;
+
+        let mut warmed_graph = build_cached_hub_sharded_graph(&workload, capacity_per_shard)?;
+
+        /*
+        Each hub is inserted into the cache belonging to
+        the shard that owns that hub.
+        */
+        for &hub_id in &ranked_hubs {
+            warmed_graph.warm_cache_for_user(hub_id)?;
+        }
+
+        let warmed = run_real_cached_queries(&reference, &mut warmed_graph, workload.user_count)?;
+
+        let cold_total = cold.hits + cold.misses;
+
+        let warmed_total = warmed.hits + warmed.misses;
+
+        let cold_startup_total = cold.startup_hits + cold.startup_misses;
+
+        let warmed_startup_total = warmed.startup_hits + warmed.startup_misses;
+
+        let cold_hit_rate = percentage(cold.hits as u64, cold_total as u64);
+
+        let warmed_hit_rate = percentage(warmed.hits as u64, warmed_total as u64);
+
+        let cold_startup_rate = percentage(cold.startup_hits as u64, cold_startup_total as u64);
+
+        let warmed_startup_rate =
+            percentage(warmed.startup_hits as u64, warmed_startup_total as u64);
+
+        println!(
+            "{:<12} {:>11.2}% {:>11.2}% {:>14.2}% {:>14.2}%",
+            capacity_per_shard,
+            cold_hit_rate,
+            warmed_hit_rate,
+            cold_startup_rate,
+            warmed_startup_rate,
+        );
+
+        csv_rows.push(format!(
+            "{},{},{},{},{},{},{},{:.2},{:.2},{:.2},{:.2}",
+            capacity_per_shard,
+            capacity_per_shard * SHARD_COUNT,
+            ranked_hubs.len(),
+            cold.hits,
+            cold.misses,
+            warmed.hits,
+            warmed.misses,
+            cold_hit_rate,
+            warmed_hit_rate,
+            cold_startup_rate,
+            warmed_startup_rate,
+        ));
+    }
+
+    write_csv("results/real_sharded_cache_warming.csv", &csv_rows)?;
+
+    println!(
+        "\nSaved results to \
+         results/real_sharded_cache_warming.csv"
     );
 
     Ok(())

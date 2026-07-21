@@ -66,6 +66,27 @@ impl ShardedGraph {
         Self::with_placement(shard_count, Placement::Hash)
     }
 
+    pub fn warm_cache_for_user(&mut self, user_id: u64) -> Result<(), String> {
+        let shard_id = self
+            .try_shard_for(user_id)
+            .ok_or_else(|| format!("Cannot find shard for user {user_id}"))?;
+
+        if self.shards[shard_id].get_user(user_id).is_none() {
+            return Err(format!("User {user_id} does not exist"));
+        }
+
+        let adjacency_list = self.shards[shard_id].get_following_ids(user_id).to_vec();
+
+        let caches = self
+            .caches
+            .as_mut()
+            .ok_or_else(|| "Caching is disabled for this ShardedGraph".to_string())?;
+
+        caches[shard_id].insert(user_id, adjacency_list);
+
+        Ok(())
+    }
+
     pub fn new_with_cache(
         shard_count: usize,
         cache_capacity_per_shard: usize,
@@ -531,6 +552,20 @@ mod tests {
         }
 
         assert_eq!(graph.users_per_shard(), vec![2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn warming_preloads_real_adjacency_data() {
+        let mut graph = build_cached_sample_graph();
+
+        graph.warm_cache_for_user(2).unwrap();
+
+        let result = graph.get_two_hop_with_cache_stats(1).unwrap();
+
+        // User 1 follows users 2 and 3.
+        // User 2 was warmed, while user 3 was not.
+        assert_eq!(result.cache_hits, 1);
+        assert_eq!(result.cache_misses, 1);
     }
 
     #[test]

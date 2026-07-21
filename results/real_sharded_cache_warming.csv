@@ -1,0 +1,5 @@
+cache_capacity_per_shard,total_cache_capacity,preloaded_hubs,cold_hits,cold_misses,warmed_hits,warmed_misses,cold_hit_rate_percent,warmed_hit_rate_percent,cold_startup_hit_rate_percent,warmed_startup_hit_rate_percent
+25,100,100,4935,75065,4947,75053,6.17,6.18,5.70,6.90
+50,200,100,9300,70700,9335,70665,11.62,11.67,10.90,14.40
+100,400,100,15561,64439,15623,64377,19.45,19.53,16.30,22.50
+250,1000,100,24560,55440,24657,55343,30.70,30.82,18.80,28.00
