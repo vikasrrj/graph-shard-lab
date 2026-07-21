@@ -144,6 +144,101 @@ def generate_batching_by_shards_chart() -> None:
     print(f"Created {output_path}")
 
 
+def generate_cache_baseline_chart() -> None:
+    rows = read_csv(RESULTS_DIR / "cache_baseline.csv")
+
+    capacities = [int(row["capacity"]) for row in rows]
+
+    overall_hit_rates = [float(row["hit_rate_percent"]) for row in rows]
+
+    hub_hit_rates = [float(row["hub_hit_rate_percent"]) for row in rows]
+
+    normal_hit_rates = [float(row["normal_hit_rate_percent"]) for row in rows]
+
+    plt.figure(figsize=(9, 5.5))
+
+    plt.plot(
+        capacities,
+        overall_hit_rates,
+        marker="o",
+        label="Overall hit rate",
+    )
+
+    plt.plot(
+        capacities,
+        hub_hit_rates,
+        marker="o",
+        label="Hub hit rate",
+    )
+
+    plt.plot(
+        capacities,
+        normal_hit_rates,
+        marker="o",
+        label="Normal-user hit rate",
+    )
+
+    plt.title("Cold LRU Cache on a Hub-Heavy Workload")
+    plt.xlabel("Cache capacity in adjacency lists")
+    plt.ylabel("Cache hit rate (%)")
+
+    plt.xticks(capacities)
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    output_path = IMAGES_DIR / "cache_baseline.svg"
+
+    plt.savefig(output_path, format="svg")
+    plt.close()
+
+    print(f"Created {output_path}")
+
+
+def generate_cache_warming_chart() -> None:
+    rows = read_csv(RESULTS_DIR / "cache_warming.csv")
+
+    capacities = [int(row["capacity"]) for row in rows]
+
+    cold_startup_rates = [float(row["cold_startup_hit_rate_percent"]) for row in rows]
+
+    warmed_startup_rates = [
+        float(row["warmed_startup_hit_rate_percent"]) for row in rows
+    ]
+
+    plt.figure(figsize=(9, 5.5))
+
+    plt.plot(
+        capacities,
+        cold_startup_rates,
+        marker="o",
+        label="Cold cache",
+    )
+
+    plt.plot(
+        capacities,
+        warmed_startup_rates,
+        marker="o",
+        label="Degree-warmed cache",
+    )
+
+    plt.title("Cache Warming During the First 1,000 Reads")
+    plt.xlabel("Cache capacity in adjacency lists")
+    plt.ylabel("Startup cache hit rate (%)")
+
+    plt.xticks(capacities)
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    output_path = IMAGES_DIR / "cache_warming.svg"
+
+    plt.savefig(output_path, format="svg")
+    plt.close()
+
+    print(f"Created {output_path}")
+
+
 def generate_tradeoff_chart() -> None:
     rows = read_csv(RESULTS_DIR / "uneven_communities.csv")
 
@@ -213,6 +308,8 @@ def main() -> None:
     generate_locality_chart()
     generate_batching_chart()
     generate_batching_by_shards_chart()
+    generate_cache_baseline_chart()
+    generate_cache_warming_chart()
     generate_tradeoff_chart()
 
 
