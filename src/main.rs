@@ -5,6 +5,7 @@ use std::{
 
 use graph_shard_lab::{
     Graph,
+    cache::LruCache,
     sharded::{Placement, QueryResult, ShardedGraph},
     uneven::generate_uneven_community_workload,
     workload::{CommunityWorkload, generate_community_workload, generate_hub_workload},
@@ -28,12 +29,14 @@ const UNEVEN_COMMUNITY_SIZES: [u64; 5] = [4_000, 2_500, 1_500, 1_000, 1_000];
 const UNEVEN_LOCAL_EDGES: u64 = 7;
 const HUB_COUNT: u64 = 100;
 const HUB_EDGES_PER_USER: u64 = 2;
+const CACHE_CAPACITIES: [usize; 6] = [25, 50, 100, 250, 500, 1_000];
 
 fn main() -> Result<(), String> {
     run_locality_sweep()?;
     run_uneven_community_benchmark()?;
     run_multi_seed_shard_sweep()?;
     run_hub_hotspot_baseline()?;
+    run_hotspot_cache_baseline()?;
 
     Ok(())
 }
@@ -482,6 +485,116 @@ fn run_hub_hotspot_baseline() -> Result<(), String> {
     println!("\nSaved results to results/hub_hotspot.csv");
 
     Ok(())
+}
+fn run_hotspot_cache_baseline() -> Result<(), String> {
+    let workload = generate_hub_workload(
+        USER_COUNT,
+        HUB_COUNT,
+        EDGES_PER_USER,
+        HUB_EDGES_PER_USER,
+        SEED,
+    )?;
+
+    println!(
+        "\nCold LRU cache on hub-heavy workload\n\
+         Total logical adjacency reads: {}\n\
+         Cache starts empty\n",
+        workload.edges.len(),
+    );
+
+    println!(
+        "{:<10} {:<10} {:<10} {:<12} {:<12} {:<12}",
+        "Capacity", "Hits", "Misses", "Hit rate", "Hub rate", "Normal rate",
+    );
+
+    println!("{}", "-".repeat(72));
+
+    let mut csv_rows = vec![
+        "capacity,total_accesses,hits,misses,hit_rate_percent,\
+         hub_hit_rate_percent,normal_hit_rate_percent,\
+         main_graph_reads_avoided"
+            .replace(' ', ""),
+    ];
+
+    for capacity in CACHE_CAPACITIES {
+        let mut cache = LruCache::new(capacity)?;
+
+        let mut hits = 0_u64;
+        let mut misses = 0_u64;
+
+        let mut hub_hits = 0_u64;
+        let mut hub_misses = 0_u64;
+
+        let mut normal_hits = 0_u64;
+        let mut normal_misses = 0_u64;
+
+        /*
+        The edge order represents running one query from each source.
+
+        For every source -> target edge, the two-hop query reads
+        target's adjacency list.
+        */
+        for &(_, target) in &workload.edges {
+            let is_hub = target <= HUB_COUNT;
+            let cache_hit = cache.access(target);
+
+            match (cache_hit, is_hub) {
+                (true, true) => {
+                    hits += 1;
+                    hub_hits += 1;
+                }
+                (true, false) => {
+                    hits += 1;
+                    normal_hits += 1;
+                }
+                (false, true) => {
+                    misses += 1;
+                    hub_misses += 1;
+                }
+                (false, false) => {
+                    misses += 1;
+                    normal_misses += 1;
+                }
+            }
+        }
+
+        let total_accesses = hits + misses;
+
+        if total_accesses != workload.edges.len() as u64 {
+            return Err("Cache accounting does not match workload".to_string());
+        }
+
+        let hit_rate = percentage(hits, total_accesses);
+
+        let hub_hit_rate = percentage(hub_hits, hub_hits + hub_misses);
+
+        let normal_hit_rate = percentage(normal_hits, normal_hits + normal_misses);
+
+        println!(
+            "{:<10} {:<10} {:<10} {:>10.2}% {:>10.2}% {:>10.2}%",
+            capacity, hits, misses, hit_rate, hub_hit_rate, normal_hit_rate,
+        );
+
+        csv_rows.push(format!(
+            "{capacity},{total_accesses},{hits},{misses},\
+             {hit_rate:.2},{hub_hit_rate:.2},\
+             {normal_hit_rate:.2},{hits}"
+        ));
+    }
+
+    write_csv("results/cache_baseline.csv", &csv_rows)?;
+
+    println!("\nSaved results to results/cache_baseline.csv");
+
+    Ok(())
+}
+
+fn percentage(part: u64, total: u64) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+
+    part as f64 / total as f64 * 100.0
 }
 
 fn build_reference_graph(workload: &CommunityWorkload) -> Result<Graph, String> {
