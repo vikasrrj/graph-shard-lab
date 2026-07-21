@@ -13,6 +13,9 @@ The project compares:
 - balanced community placement;
 - direct two-hop query execution;
 - batched two-hop query execution.
+- hub-heavy workload generation and hotspot analysis;
+- bounded LRU cache simulation;
+- degree-based cache warming experiments.
 
 All shards are logical, in-memory shards running inside one Rust process.
 
@@ -119,6 +122,77 @@ Balanced community placement keeps most of the locality benefit while improving 
 The remaining 60% imbalance cannot be removed without splitting the largest 4,000-user community.
 
 ![Shard balance versus graph locality](docs/images/uneven_tradeoff.svg)
+
+## Hub-heavy hotspots and caching
+
+The hub-heavy workload contains:
+
+- 10,000 users;
+- 100 hub users;
+- 8 outgoing edges per user;
+- 2 edges per user targeting hubs.
+
+The hubs represent only **1% of all users**, but receive **25% of all logical adjacency reads**.
+
+| User type | Average adjacency reads |
+|---|---:|
+| Hub | 200.00 |
+| Normal user | 6.06 |
+
+An average hub adjacency list is therefore read **33× more often** than an average normal-user adjacency list.
+
+This creates a concentrated hot set that can benefit from caching.
+
+### Cold bounded LRU cache
+
+The cache starts empty and stores user IDs representing cached adjacency lists.
+
+A cache hit means that a repeated logical adjacency lookup could be served from the cache rather than the main graph structure.
+
+| Capacity | Overall hit rate | Hub hit rate | Normal-user hit rate |
+|---:|---:|---:|---:|
+| 25 | 1.60% | 5.90% | 0.17% |
+| 50 | 3.14% | 11.43% | 0.38% |
+| 100 | 6.12% | 22.12% | 0.78% |
+| 250 | 13.95% | 49.56% | 2.08% |
+| 500 | 22.22% | 76.05% | 4.28% |
+| 1,000 | 30.67% | 95.47% | 9.07% |
+
+At capacity `1,000`, the cache served **95.47% of repeated hub accesses**, compared with only **9.07% of normal-user accesses**.
+
+This shows that concentrated graph hotspots are much more cacheable than a large, weakly reused normal-user set.
+
+![Cold LRU cache hit rates](docs/images/cache_baseline.svg)
+
+### Degree-based cache warming
+
+The warming experiment preloads the most-followed hubs before measured traffic begins.
+
+Warming had little effect across the complete 80,000-access run because a cold LRU cache gradually learned the popular users itself.
+
+However, warming improved startup behavior during the first 1,000 accesses:
+
+| Capacity | Cold startup hit rate | Warmed startup hit rate | Improvement |
+|---:|---:|---:|---:|
+| 250 | 12.60% | 17.10% | +4.50 points |
+| 500 | 17.30% | 24.50% | +7.20 points |
+| 1,000 | 18.80% | 28.00% | +9.20 points |
+
+Across the complete workload, warming improved the total hit rate by at most `0.13` percentage points.
+
+Therefore, the main benefit of warming in this experiment is avoiding cold-start misses rather than improving steady-state behavior.
+
+![Cold versus degree-warmed startup cache](docs/images/cache_warming.svg)
+
+These are simulated logical cache hits. The cache currently stores user IDs rather than actual adjacency-list data, and the experiment does not measure real latency.
+
+
+
+
+
+
+
+
 
 ## Graph model
 
@@ -307,31 +381,38 @@ Parameters include:
 - community sizes;
 - edges per user;
 - local edges per user;
-- external edges per user;
+- hub count;
+- hub-targeting edges per user;
 - random seed;
 - shard count.
-
-The same generated edge list is supplied to every placement strategy, ensuring a fair comparison.
 
 Using the same seed and parameters produces the same graph.
 
 Current benchmark families:
 
 1. **Locality sweep**  
-   Equal-sized communities with different levels of locality (`0, 2, 4, 6, 7, 8` local edges per user).
+   Equal-sized communities with `0, 2, 4, 6, 7, or 8` local edges per user.
 
 2. **Uneven-community workload**  
-   Uneven community sizes:
+   Community sizes:
 
    ```text
    [4000, 2500, 1500, 1000, 1000]
-   ```
 
-3. **Multi-seed, multi-shard batching sweep**  
-   Community workload tested across:
+3. **Multi-seed, multi-shard batching sweep**
+   Tested across:
    - seeds `42, 43, 44, 45, 46`
    - shard counts `2, 4, 8, 16`
    - locality levels `4` and `7`
+
+4. **Hub-heavy workload**  
+   A small set of hub users receives a large share of incoming edges and repeated adjacency reads.
+
+5. **Cold-cache sweep**  
+   The hub-heavy access stream is replayed through bounded LRU caches with capacities from 25 to 1,000.
+
+6. **Cache-warming sweep**  
+   The same access stream is tested with caches preloaded using the most-followed hubs.
 
 ## Run the project
 
@@ -373,6 +454,9 @@ Benchmark CSV files:
 results/locality_sweep.csv
 results/uneven_communities.csv
 results/batching_sweep.csv
+results/hub_hotspot.csv
+results/cache_baseline.csv
+results/cache_warming.csv
 ```
 
 Generated charts:
@@ -382,12 +466,17 @@ docs/images/locality_sweep.svg
 docs/images/batching_requests.svg
 docs/images/batching_by_shards.svg
 docs/images/uneven_tradeoff.svg
+docs/images/cache_baseline.svg
+docs/images/cache_warming.svg
 ```
+
+## Project structure
 
 ```text
 graph-shard-lab/
 ├── src/
 │   ├── balanced.rs
+│   ├── cache.rs
 │   ├── lib.rs
 │   ├── main.rs
 │   ├── sharded.rs
@@ -398,7 +487,10 @@ graph-shard-lab/
 ├── results/
 │   ├── locality_sweep.csv
 │   ├── uneven_communities.csv
-│   └── batching_sweep.csv
+│   ├── batching_sweep.csv
+│   ├── hub_hotspot.csv
+│   ├── cache_baseline.csv
+│   └── cache_warming.csv
 ├── scripts/
 │   └── generate_charts.py
 ├── docs/
@@ -406,7 +498,9 @@ graph-shard-lab/
 │       ├── locality_sweep.svg
 │       ├── batching_requests.svg
 │       ├── batching_by_shards.svg
-│       └── uneven_tradeoff.svg
+│       ├── uneven_tradeoff.svg
+│       ├── cache_baseline.svg
+│       └── cache_warming.svg
 ├── DESIGN.md
 ├── Cargo.toml
 └── README.md
@@ -428,6 +522,11 @@ GraphShard Lab is a research prototype, not a production distributed database.
 - Data is not persisted to disk.
 - There is no failover or replication protocol.
 - Workloads are synthetic.
+- The LRU cache currently stores user IDs representing cached adjacency lists, not the adjacency-list data itself.
+- Cache accesses are replayed from the generated edge stream rather than integrated into real shard execution.
+- The current cache is one logical simulator, not one independent cache per shard.
+- Cache hits represent avoided logical graph lookups, not measured memory, disk, or network savings.
+- Cache warming uses complete workload degree information, which is an idealized assumption.
 
 Therefore:
 
@@ -437,9 +536,11 @@ Therefore:
 
 Possible extensions include:
 
-- hotspot and hub-heavy workloads;
-- cache warming experiments;
-- bounded memory caches;
+- storing actual adjacency lists in the cache;
+- integrating cache lookups into two-hop query execution;
+- maintaining one independent cache per shard;
+- comparing LRU with LFU and other eviction policies;
+- warming caches using observed traffic rather than complete workload knowledge;
 - shard workers implemented as Tokio tasks;
 - message channels between shards;
 - configurable simulated network delay;
@@ -448,7 +549,6 @@ Possible extensions include:
 - dynamic shard rebalancing;
 - oversized-community splitting;
 - persistent storage.
-
 ## Conclusion
 
 Hash placement provides strong shard balance but ignores graph structure.
