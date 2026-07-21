@@ -558,7 +558,6 @@ GraphShard Lab is a research prototype, not a production distributed database.
 - Workloads are synthetic.
 - Cache capacity counts adjacency-list entries rather than memory bytes.
 - Cached adjacency lists are cloned when returned.
-- Cache invalidation after graph updates is not implemented.
 - Cache warming uses complete workload degree information, which is an idealized assumption.
 - Cache-hit improvements are not equivalent to measured latency improvements.
 
