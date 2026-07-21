@@ -192,12 +192,14 @@ The cache was then integrated into actual sharded two-hop query execution.
 
 Each of the four logical shards owns an independent LRU cache containing real adjacency lists:
 
-```text
+
 user ID → IDs of users followed
 
 On a cache miss, the query reads the adjacency list from the owning shard’s graph and inserts it into that shard’s cache. On a hit, the cached adjacency list is used directly.
 
 Every cached query result was checked against the uncached reference graph.
+
+
 
 | Capacity per shard | Total capacity | Cache hits | Cache misses | Hit rate |
 | -----------------: | -------------: | ---------: | -----------: | -------: |
@@ -560,6 +562,12 @@ GraphShard Lab is a research prototype, not a production distributed database.
 - The current cache is one logical simulator, not one independent cache per shard.
 - Cache hits represent avoided logical graph lookups, not measured memory, disk, or network savings.
 - Cache warming uses complete workload degree information, which is an idealized assumption.
+- Shards and shard-local caches still run inside one process.
+- Cache capacity counts adjacency lists rather than actual memory bytes.
+- Cached adjacency lists are cloned when returned.
+- Cache invalidation for graph updates is not implemented.
+- Cache-hit improvements are not measured as real latency improvements.
+
 
 Therefore:
 
@@ -569,9 +577,7 @@ Therefore:
 
 Possible extensions include:
 
-- storing actual adjacency lists in the cache;
-- integrating cache lookups into two-hop query execution;
-- maintaining one independent cache per shard;
+
 - comparing LRU with LFU and other eviction policies;
 - warming caches using observed traffic rather than complete workload knowledge;
 - shard workers implemented as Tokio tasks;
@@ -582,6 +588,11 @@ Possible extensions include:
 - dynamic shard rebalancing;
 - oversized-community splitting;
 - persistent storage.
+- - cache invalidation when edges are added or removed;
+- byte-bounded caches instead of entry-count limits;
+- a more efficient constant-time LRU implementation;
+
+
 ## Conclusion
 
 Hash placement provides strong shard balance but ignores graph structure.
