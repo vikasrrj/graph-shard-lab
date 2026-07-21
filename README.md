@@ -563,6 +563,7 @@ GraphShard Lab is a research prototype, not a production distributed database.
 - Cache-hit improvements are not equivalent to measured latency improvements.
 
 The project retains an earlier ID-only cache simulator for comparison. Actual cached sharded queries use independent shard-local caches containing complete adjacency-list data.
+
 ## Future work
 
 Possible extensions include:
