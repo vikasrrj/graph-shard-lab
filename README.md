@@ -186,11 +186,41 @@ Therefore, the main benefit of warming in this experiment is avoiding cold-start
 
 These are simulated logical cache hits. The cache currently stores user IDs rather than actual adjacency-list data, and the experiment does not measure real latency.
 
+### Real shard-local adjacency caches
+
+The cache was then integrated into actual sharded two-hop query execution.
+
+Each of the four logical shards owns an independent LRU cache containing real adjacency lists:
+
+```text
+user ID → IDs of users followed
+
+On a cache miss, the query reads the adjacency list from the owning shard’s graph and inserts it into that shard’s cache. On a hit, the cached adjacency list is used directly.
+
+Every cached query result was checked against the uncached reference graph.
+
+| Capacity per shard | Total capacity | Cache hits | Cache misses | Hit rate |
+| -----------------: | -------------: | ---------: | -----------: | -------: |
+|                 25 |            100 |      4,935 |       75,065 |    6.17% |
+|                 50 |            200 |      9,300 |       70,700 |   11.62% |
+|                100 |            400 |     15,561 |       64,439 |   19.45% |
+|                250 |          1,000 |     24,560 |       55,440 |   30.70% |
+
+With 1,000 total cached adjacency lists, 30.70% of accesses were served from actual shard-local caches while returning identical query results.
+
+Real cache warming produced the following startup result:
+
+| Capacity per shard | Cold first 1,000 | Warm first 1,000 |  Improvement |
+| -----------------: | ---------------: | ---------------: | -----------: |
+|                 25 |            5.70% |            6.90% | +1.20 points |
+|                 50 |           10.90% |           14.40% | +3.50 points |
+|                100 |           16.30% |           22.50% | +6.20 points |
+|                250 |           18.80% |           28.00% | +9.20 points |
 
 
+Across the complete workload, warming improved the hit rate by only 0.12 percentage points at the largest capacity because the cold LRU cache learned the hot set during traffic.
 
-
-
+These measurements show cache reuse, not query-speed improvement. The shards and caches still run inside one process, and real latency is not measured.
 
 
 
@@ -457,6 +487,8 @@ results/batching_sweep.csv
 results/hub_hotspot.csv
 results/cache_baseline.csv
 results/cache_warming.csv
+results/real_sharded_cache.csv
+results/real_sharded_cache_warming.csv
 ```
 
 Generated charts:
@@ -468,6 +500,7 @@ docs/images/batching_by_shards.svg
 docs/images/uneven_tradeoff.svg
 docs/images/cache_baseline.svg
 docs/images/cache_warming.svg
+docs/images/real_sharded_cache_warming.svg
 ```
 
 ## Project structure

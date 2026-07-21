@@ -239,6 +239,50 @@ def generate_cache_warming_chart() -> None:
     print(f"Created {output_path}")
 
 
+def generate_real_cache_warming_chart() -> None:
+    rows = read_csv(RESULTS_DIR / "real_sharded_cache_warming.csv")
+
+    total_capacities = [int(row["total_cache_capacity"]) for row in rows]
+
+    cold_startup_rates = [float(row["cold_startup_hit_rate_percent"]) for row in rows]
+
+    warmed_startup_rates = [
+        float(row["warmed_startup_hit_rate_percent"]) for row in rows
+    ]
+
+    plt.figure(figsize=(9, 5.5))
+
+    plt.plot(
+        total_capacities,
+        cold_startup_rates,
+        marker="o",
+        label="Cold shard caches",
+    )
+
+    plt.plot(
+        total_capacities,
+        warmed_startup_rates,
+        marker="o",
+        label="Warmed shard caches",
+    )
+
+    plt.title("Real Shard-Local Cache Warming")
+    plt.xlabel("Total cache capacity across 4 shards")
+    plt.ylabel("Hit rate during first 1,000 accesses (%)")
+
+    plt.xticks(total_capacities)
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    output_path = IMAGES_DIR / "real_sharded_cache_warming.svg"
+
+    plt.savefig(output_path, format="svg")
+    plt.close()
+
+    print(f"Created {output_path}")
+
+
 def generate_tradeoff_chart() -> None:
     rows = read_csv(RESULTS_DIR / "uneven_communities.csv")
 
@@ -311,6 +355,7 @@ def main() -> None:
     generate_cache_baseline_chart()
     generate_cache_warming_chart()
     generate_tradeoff_chart()
+    generate_real_cache_warming_chart()
 
 
 if __name__ == "__main__":
