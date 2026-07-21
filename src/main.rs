@@ -5,7 +5,7 @@ use std::{
 
 use graph_shard_lab::{
     Graph,
-    cache::LruCache,
+    cache::IdLruSimulator,
     sharded::{Placement, QueryResult, ShardedGraph},
     uneven::generate_uneven_community_workload,
     workload::{
@@ -539,7 +539,7 @@ fn run_hotspot_cache_baseline() -> Result<(), String> {
     ];
 
     for capacity in CACHE_CAPACITIES {
-        let mut cache = LruCache::new(capacity)?;
+        let mut cache = IdLruSimulator::new(capacity)?;
 
         let mut hits = 0_u64;
         let mut misses = 0_u64;
@@ -624,7 +624,7 @@ fn simulate_cache_run(
     capacity: usize,
     preloaded_user_ids: &[u64],
 ) -> Result<CacheRunStats, String> {
-    let mut cache = LruCache::new(capacity)?;
+    let mut cache = IdLruSimulator::new(capacity)?;
 
     /*
     Preloading happens before measured traffic begins.

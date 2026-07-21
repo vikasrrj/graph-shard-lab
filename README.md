@@ -547,24 +547,22 @@ GraphShard Lab is a research prototype, not a production distributed database.
 
 - All shards and shard-local caches run inside one process.
 - Data is stored only in memory.
-- Cross-shard hops are logical measurements.
-- Shard requests are logical request counts.
+- Cross-shard hops and shard requests are logical measurements.
 - No real network communication occurs.
-- Real latency, throughput, and hardware-level cache behavior are not measured.
-- Community membership is provided in advance.
+- Real latency and throughput are not measured.
+- Community membership is supplied in advance.
 - Oversized communities are not split.
 - Nodes are not replicated.
 - Data is not persisted to disk.
 - There is no failover or replication protocol.
 - Workloads are synthetic.
-- Cache capacity counts adjacency lists rather than actual memory bytes.
+- Cache capacity counts adjacency-list entries rather than memory bytes.
 - Cached adjacency lists are cloned when returned.
 - Cache invalidation after graph updates is not implemented.
 - Cache warming uses complete workload degree information, which is an idealized assumption.
-- A cache hit represents an in-memory adjacency-list reuse, not a measured disk, network, or latency improvement.
+- Cache-hit improvements are not equivalent to measured latency improvements.
 
-The project also retains an earlier ID-only LRU simulator for comparison, but real sharded two-hop queries use independent shard-local caches containing actual adjacency-list data.
-
+The project retains an earlier ID-only cache simulator for comparison. Actual cached sharded queries use independent shard-local caches containing complete adjacency-list data.
 ## Future work
 
 Possible extensions include:

@@ -5,12 +5,12 @@ use std::collections::VecDeque;
 /// This stores only user IDs and is used by the existing
 /// logical cache-hit benchmarks.
 #[derive(Debug)]
-pub struct LruCache {
+pub struct IdLruSimulator {
     capacity: usize,
     entries: VecDeque<u64>,
 }
 
-impl LruCache {
+impl IdLruSimulator {
     pub fn new(capacity: usize) -> Result<Self, String> {
         if capacity == 0 {
             return Err("Cache capacity must be greater than zero".to_string());
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn first_access_is_a_miss_and_second_is_a_hit() {
-        let mut cache = LruCache::new(3).unwrap();
+        let mut cache = IdLruSimulator::new(3).unwrap();
 
         assert!(!cache.access(10));
         assert!(cache.access(10));
@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn never_exceeds_capacity() {
-        let mut cache = LruCache::new(2).unwrap();
+        let mut cache = IdLruSimulator::new(2).unwrap();
 
         cache.access(10);
         cache.access(20);
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn evicts_the_least_recently_used_entry() {
-        let mut cache = LruCache::new(3).unwrap();
+        let mut cache = IdLruSimulator::new(3).unwrap();
 
         cache.access(10);
         cache.access(20);
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn rejects_zero_capacity() {
-        assert!(LruCache::new(0).is_err());
+        assert!(IdLruSimulator::new(0).is_err());
     }
 
     #[test]
