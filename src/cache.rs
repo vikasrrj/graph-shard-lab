@@ -127,6 +127,24 @@ impl AdjacencyLruCache {
         self.entries.push_back((user_id, adjacency_list));
     }
 
+    /// Removes one user's cached adjacency list.
+    ///
+    /// Returns true when an entry existed and was removed.
+    /// Returns false when the user was not cached.
+    pub fn invalidate(&mut self, user_id: u64) -> bool {
+        let Some(position) = self
+            .entries
+            .iter()
+            .position(|(cached_id, _)| *cached_id == user_id)
+        else {
+            return false;
+        };
+
+        self.entries.remove(position);
+
+        true
+    }
+
     pub fn contains(&self, user_id: u64) -> bool {
         self.entries
             .iter()
@@ -172,6 +190,31 @@ mod tests {
         assert!(cache.contains(30));
     }
 
+    #[test]
+    fn adjacency_cache_can_invalidate_an_entry() {
+        let mut cache = AdjacencyLruCache::new(2).unwrap();
+
+        cache.insert(10, vec![20, 30]);
+        cache.insert(11, vec![40, 50]);
+
+        assert!(cache.contains(10));
+        assert_eq!(cache.len(), 2);
+
+        let removed = cache.invalidate(10);
+
+        assert!(removed);
+        assert!(!cache.contains(10));
+        assert_eq!(cache.len(), 1);
+
+        // Invalidating an absent entry should do nothing.
+        let removed_again = cache.invalidate(10);
+
+        assert!(!removed_again);
+        assert_eq!(cache.len(), 1);
+
+        // Other cached entries must remain untouched.
+        assert!(cache.contains(11));
+    }
     #[test]
     fn evicts_the_least_recently_used_entry() {
         let mut cache = IdLruSimulator::new(3).unwrap();

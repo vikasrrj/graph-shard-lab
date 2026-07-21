@@ -76,6 +76,43 @@ impl Graph {
         Ok(())
     }
 
+    pub fn remove_follow(&mut self, source: u64, target: u64) -> Result<bool, String> {
+        if !self.users.contains_key(&source) {
+            return Err(format!("Source user {source} does not exist"));
+        }
+
+        if !self.users.contains_key(&target) {
+            return Err(format!("Target user {target} does not exist"));
+        }
+
+        self.remove_follow_unchecked(source, target)
+    }
+
+    pub(crate) fn remove_follow_unchecked(
+        &mut self,
+        source: u64,
+        target: u64,
+    ) -> Result<bool, String> {
+        if !self.users.contains_key(&source) {
+            return Err(format!("Source user {source} does not exist"));
+        }
+
+        let Some(targets) = self.follows.get_mut(&source) else {
+            return Ok(false);
+        };
+
+        let Some(position) = targets
+            .iter()
+            .position(|existing_target| *existing_target == target)
+        else {
+            return Ok(false);
+        };
+
+        targets.remove(position);
+
+        Ok(true)
+    }
+
     pub fn get_user(&self, id: u64) -> Option<&User> {
         self.users.get(&id)
     }
@@ -178,6 +215,38 @@ mod tests {
         graph.add_follow(3, 4).unwrap();
 
         graph
+    }
+
+    #[test]
+    fn removes_an_existing_edge() {
+        let mut graph = Graph::new();
+
+        graph.add_user(1, "Alice").unwrap();
+        graph.add_user(2, "Bob").unwrap();
+        graph.add_user(3, "Charlie").unwrap();
+
+        graph.add_follow(1, 2).unwrap();
+        graph.add_follow(1, 3).unwrap();
+
+        assert_eq!(graph.get_following_ids(1), &[2, 3]);
+
+        let removed = graph.remove_follow(1, 2).unwrap();
+
+        assert!(removed);
+        assert_eq!(graph.get_following_ids(1), &[3]);
+    }
+
+    #[test]
+    fn removing_a_missing_edge_returns_false() {
+        let mut graph = Graph::new();
+
+        graph.add_user(1, "Alice").unwrap();
+        graph.add_user(2, "Bob").unwrap();
+
+        let removed = graph.remove_follow(1, 2).unwrap();
+
+        assert!(!removed);
+        assert!(graph.get_following_ids(1).is_empty());
     }
 
     #[test]

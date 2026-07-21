@@ -264,7 +264,39 @@ impl ShardedGraph {
             .try_shard_for(source)
             .ok_or_else(|| format!("Cannot find shard for user {source}"))?;
 
-        self.shards[source_shard].add_follow_unchecked(source, target)
+        let edge_already_exists = self.shards[source_shard]
+            .get_following_ids(source)
+            .contains(&target);
+
+        self.shards[source_shard].add_follow_unchecked(source, target)?;
+
+        if !edge_already_exists {
+            self.invalidate_cached_adjacency(source_shard, source);
+        }
+
+        Ok(())
+    }
+
+    pub fn remove_follow(&mut self, source: u64, target: u64) -> Result<bool, String> {
+        if self.get_user(source).is_none() {
+            return Err(format!("Source user {source} does not exist"));
+        }
+
+        if self.get_user(target).is_none() {
+            return Err(format!("Target user {target} does not exist"));
+        }
+
+        let source_shard = self
+            .try_shard_for(source)
+            .ok_or_else(|| format!("Cannot find shard for user {source}"))?;
+
+        let removed = self.shards[source_shard].remove_follow_unchecked(source, target)?;
+
+        if removed {
+            self.invalidate_cached_adjacency(source_shard, source);
+        }
+
+        Ok(removed)
     }
 
     pub fn get_user(&self, id: u64) -> Option<&User> {
@@ -278,6 +310,11 @@ impl ShardedGraph {
         };
 
         self.shards[shard_id].get_following_ids(source)
+    }
+    fn invalidate_cached_adjacency(&mut self, shard_id: usize, user_id: u64) {
+        if let Some(caches) = self.caches.as_mut() {
+            caches[shard_id].invalidate(user_id);
+        }
     }
 
     pub fn get_two_hop_with_stats(&self, source: u64) -> QueryResult {
@@ -743,6 +780,55 @@ mod tests {
         assert_eq!(result.shards_touched, 3);
         assert_eq!(result.cross_shard_hops, 2);
         assert_eq!(result.shard_requests, 2);
+    }
+
+    #[test]
+    fn edge_mutations_invalidate_cached_adjacency_lists() {
+        let mut graph = ShardedGraph::new_with_cache(2, 10).unwrap();
+
+        graph.add_user(1, "Alice").unwrap();
+        graph.add_user(2, "Bob").unwrap();
+        graph.add_user(3, "Charlie").unwrap();
+        graph.add_user(4, "Diana").unwrap();
+
+        graph.add_follow(1, 2).unwrap();
+        graph.add_follow(2, 3).unwrap();
+
+        // First query loads User 2's adjacency list into its shard cache.
+        let first = graph.get_two_hop_with_cache_stats(1).unwrap();
+
+        assert_eq!(first.user_ids, vec![3]);
+        assert_eq!(first.cache_hits, 0);
+        assert_eq!(first.cache_misses, 1);
+
+        // User 2's adjacency list changes from [3] to [3, 4].
+        graph.add_follow(2, 4).unwrap();
+
+        // The old cached [3] must have been invalidated.
+        let after_add = graph.get_two_hop_with_cache_stats(1).unwrap();
+
+        assert_eq!(after_add.user_ids, vec![3, 4]);
+        assert_eq!(after_add.cache_hits, 0);
+        assert_eq!(after_add.cache_misses, 1);
+
+        // The fresh [3, 4] is now cached.
+        let repeated = graph.get_two_hop_with_cache_stats(1).unwrap();
+
+        assert_eq!(repeated.user_ids, vec![3, 4]);
+        assert_eq!(repeated.cache_hits, 1);
+        assert_eq!(repeated.cache_misses, 0);
+
+        // Remove 2 → 3, changing User 2's adjacency list to [4].
+        let removed = graph.remove_follow(2, 3).unwrap();
+
+        assert!(removed);
+
+        // Removal must invalidate the cached [3, 4].
+        let after_remove = graph.get_two_hop_with_cache_stats(1).unwrap();
+
+        assert_eq!(after_remove.user_ids, vec![4]);
+        assert_eq!(after_remove.cache_hits, 0);
+        assert_eq!(after_remove.cache_misses, 1);
     }
 
     #[test]
