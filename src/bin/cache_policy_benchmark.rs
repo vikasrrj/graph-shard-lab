@@ -112,7 +112,7 @@ fn cached_two_hop(source: u64, caches: &mut [AdjacencyLruCache]) -> (Vec<u64>, u
     for first_hop in first_hops_for(source) {
         let shard_id = shard_for(first_hop);
 
-        let adjacency = match caches[shard_id].get(first_hop) {
+        let adjacency = match caches[shard_id].get_shared(first_hop) {
             Some(cached) => {
                 hits += 1;
                 cached
@@ -122,13 +122,11 @@ fn cached_two_hop(source: u64, caches: &mut [AdjacencyLruCache]) -> (Vec<u64>, u
                 misses += 1;
 
                 let adjacency = adjacency_for(first_hop);
-                let _ = caches[shard_id].insert(first_hop, adjacency.clone());
-
-                adjacency
+                caches[shard_id].insert_shared(first_hop, adjacency)
             }
         };
 
-        result.extend(adjacency);
+        result.extend(adjacency.iter().copied());
     }
 
     (result.into_iter().collect(), hits, misses)

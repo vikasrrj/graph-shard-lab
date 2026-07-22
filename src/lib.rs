@@ -153,7 +153,7 @@ impl Graph {
         let mut cache_misses = 0;
 
         for first_hop in self.get_following_ids(source) {
-            let second_hops = match cache.get(*first_hop) {
+            let second_hops = match cache.get_shared(*first_hop) {
                 Some(cached_adjacency_list) => {
                     cache_hits += 1;
                     cached_adjacency_list
@@ -164,13 +164,11 @@ impl Graph {
 
                     let adjacency_list = self.get_following_ids(*first_hop).to_vec();
 
-                    cache.insert(*first_hop, adjacency_list.clone());
-
-                    adjacency_list
+                    cache.insert_shared(*first_hop, adjacency_list)
                 }
             };
 
-            for second_hop in second_hops {
+            for &second_hop in second_hops.iter() {
                 if second_hop != source && seen.insert(second_hop) {
                     result.push(second_hop);
                 }
