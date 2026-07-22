@@ -377,6 +377,11 @@ impl AdjacencyLruCache {
 
         true
     }
+    pub fn clear(&mut self) {
+        while let Some(index) = self.head {
+            self.remove_node(index);
+        }
+    }
 
     pub fn contains(&self, user_id: u64) -> bool {
         self.locations.contains_key(&user_id)
@@ -416,6 +421,32 @@ mod tests {
 
         assert!(!cache.access(10));
         assert!(cache.access(10));
+    }
+
+    #[test]
+    fn clearing_adjacency_cache_removes_all_entries() {
+        let mut cache = AdjacencyLruCache::new(3).unwrap();
+
+        cache.insert(1, vec![10]);
+        cache.insert(2, vec![20]);
+        cache.insert(3, vec![30]);
+
+        assert_eq!(cache.len(), 3);
+
+        cache.clear();
+
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.current_bytes(), 0);
+        assert!(!cache.contains(1));
+        assert!(!cache.contains(2));
+        assert!(!cache.contains(3));
+
+        // Deleted internal slots must remain reusable.
+        cache.insert(4, vec![40]);
+
+        assert!(cache.contains(4));
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]

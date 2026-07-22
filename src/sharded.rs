@@ -53,11 +53,12 @@ pub struct CachedQueryResult {
 pub struct ShardedGraph {
     shards: Vec<Graph>,
 
-    // None means caching is disabled.
-    //
-    // Some(caches) contains exactly one independent cache
-    // for each logical shard.
     caches: Option<Vec<AdjacencyLruCache>>,
+
+    // One access-frequency map per logical shard.
+    //
+    // user ID -> number of observed adjacency reads
+    observed_adjacency_accesses: Vec<std::collections::HashMap<u64, u64>>,
 
     placement: Placement,
 }
@@ -86,6 +87,98 @@ impl ShardedGraph {
         caches[shard_id].insert(user_id, adjacency_list);
 
         Ok(())
+    }
+
+    pub fn observed_adjacency_access_count(&self, user_id: u64) -> u64 {
+        let Some(shard_id) = self.try_shard_for(user_id) else {
+            return 0;
+        };
+
+        self.observed_adjacency_accesses[shard_id]
+            .get(&user_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn clear_observed_adjacency_accesses(&mut self) {
+        for accesses in &mut self.observed_adjacency_accesses {
+            accesses.clear();
+        }
+    }
+
+    pub fn warm_cache_from_observed_traffic(
+        &mut self,
+        max_entries_per_shard: usize,
+    ) -> Result<usize, String> {
+        if max_entries_per_shard == 0 {
+            return Err("Warm entry limit must be greater than zero".to_string());
+        }
+
+        let cache_limits: Vec<usize> = self
+            .caches
+            .as_ref()
+            .ok_or_else(|| "Caching is disabled for this ShardedGraph".to_string())?
+            .iter()
+            .map(|cache| cache.capacity().min(max_entries_per_shard))
+            .collect();
+
+        /*
+        Build the plan before mutably borrowing the caches.
+
+        Each shard ranks users by:
+        1. highest observed access count
+        2. lowest user ID for deterministic ties
+        */
+        let mut warm_plan = Vec::with_capacity(self.shards.len());
+
+        for shard_id in 0..self.shards.len() {
+            let mut ranked_users: Vec<(u64, u64)> = self.observed_adjacency_accesses[shard_id]
+                .iter()
+                .map(|(&user_id, &access_count)| (user_id, access_count))
+                .collect();
+
+            ranked_users.sort_by(|(left_user, left_count), (right_user, right_count)| {
+                right_count
+                    .cmp(left_count)
+                    .then_with(|| left_user.cmp(right_user))
+            });
+
+            let mut selected_entries: Vec<(u64, Vec<u64>)> = ranked_users
+                .into_iter()
+                .take(cache_limits[shard_id])
+                .map(|(user_id, _)| {
+                    let adjacency_list = self.shards[shard_id].get_following_ids(user_id).to_vec();
+
+                    (user_id, adjacency_list)
+                })
+                .collect();
+
+            /*
+            Insert colder selected entries first and hotter entries last.
+
+            This makes the hottest entries the newest entries if a byte
+            limit forces eviction during warming.
+            */
+            selected_entries.reverse();
+
+            warm_plan.push(selected_entries);
+        }
+
+        let caches = self.caches.as_mut().expect("Caching was checked above");
+
+        for cache in caches.iter_mut() {
+            cache.clear();
+        }
+
+        for (shard_id, entries) in warm_plan.into_iter().enumerate() {
+            for (user_id, adjacency_list) in entries {
+                caches[shard_id].insert(user_id, adjacency_list);
+            }
+        }
+
+        let warmed_entry_count = caches.iter().map(|cache| cache.len()).sum();
+
+        Ok(warmed_entry_count)
     }
 
     pub fn new_with_cache(
@@ -254,6 +347,7 @@ impl ShardedGraph {
         Ok(Self {
             shards,
             caches: None,
+            observed_adjacency_accesses: vec![std::collections::HashMap::new(); shard_count],
             placement,
         })
     }
@@ -416,6 +510,14 @@ impl ShardedGraph {
         }
     }
 
+    fn record_observed_adjacency_access(&mut self, shard_id: usize, user_id: u64) {
+        let access_count = self.observed_adjacency_accesses[shard_id]
+            .entry(user_id)
+            .or_insert(0);
+
+        *access_count = access_count.saturating_add(1);
+    }
+
     pub fn get_two_hop_with_stats(&self, source: u64) -> QueryResult {
         let Some(source_shard) = self.try_shard_for(source) else {
             return QueryResult {
@@ -527,6 +629,8 @@ impl ShardedGraph {
             but it does not remove the logical shard request.
             */
             shard_requests += 1;
+
+            self.record_observed_adjacency_access(first_hop_shard, first_hop);
 
             let cached_adjacency_list = {
                 let caches = self.caches.as_mut().expect("Caching was checked above");
@@ -830,6 +934,77 @@ mod tests {
         actual.sort_unstable();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn observed_traffic_warming_preloads_hottest_adjacencies() {
+        let mut graph = ShardedGraph::new_with_cache(1, 2).unwrap();
+
+        for user_id in 1..=6 {
+            graph.add_user(user_id, &format!("user-{user_id}")).unwrap();
+        }
+
+        // Querying User 1 reads adjacency lists for Users 2 and 3.
+        graph.add_follow(1, 2).unwrap();
+        graph.add_follow(1, 3).unwrap();
+
+        // These queries create two additional accesses for User 2.
+        graph.add_follow(4, 2).unwrap();
+        graph.add_follow(5, 2).unwrap();
+
+        graph.get_two_hop_with_cache_stats(1).unwrap();
+        graph.get_two_hop_with_cache_stats(4).unwrap();
+        graph.get_two_hop_with_cache_stats(5).unwrap();
+
+        assert_eq!(graph.observed_adjacency_access_count(2), 3);
+
+        assert_eq!(graph.observed_adjacency_access_count(3), 1);
+
+        // Clear the existing cache and warm only one user per shard.
+        let warmed = graph.warm_cache_from_observed_traffic(1).unwrap();
+
+        assert_eq!(warmed, 1);
+
+        /*
+        User 2 was hottest and should be a hit.
+        User 3 was not warmed and should be a miss.
+        */
+        let result = graph.get_two_hop_with_cache_stats(1).unwrap();
+
+        assert_eq!(result.cache_hits, 1);
+        assert_eq!(result.cache_misses, 1);
+    }
+
+    #[test]
+    fn observed_access_counts_can_be_cleared() {
+        let mut graph = ShardedGraph::new_with_cache(1, 10).unwrap();
+
+        graph.add_user(1, "Alice").unwrap();
+        graph.add_user(2, "Bob").unwrap();
+
+        graph.add_follow(1, 2).unwrap();
+
+        graph.get_two_hop_with_cache_stats(1).unwrap();
+
+        assert_eq!(graph.observed_adjacency_access_count(2), 1);
+
+        graph.clear_observed_adjacency_accesses();
+
+        assert_eq!(graph.observed_adjacency_access_count(2), 0);
+    }
+
+    #[test]
+    fn observed_traffic_warming_requires_enabled_cache() {
+        let mut graph = ShardedGraph::new(2).unwrap();
+
+        assert!(graph.warm_cache_from_observed_traffic(10).is_err());
+    }
+
+    #[test]
+    fn observed_traffic_warming_rejects_zero_limit() {
+        let mut graph = ShardedGraph::new_with_cache(2, 10).unwrap();
+
+        assert!(graph.warm_cache_from_observed_traffic(0).is_err());
     }
 
     #[test]
