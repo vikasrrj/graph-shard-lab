@@ -72,12 +72,24 @@ impl IdLruSimulator {
 ///
 /// user ID -> IDs of users that user follows
 ///
+///
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictionPolicy {
+    Lru,
+    Fifo,
+    Lfu,
+}
 
 #[derive(Debug)]
 struct CacheNode {
     user_id: u64,
     adjacency_list: Vec<u64>,
     estimated_size_bytes: usize,
+
+    frequency: u64,
+    inserted_at: u64,
+    last_accessed_at: u64,
+
     previous: Option<usize>,
     next: Option<usize>,
 }
@@ -88,6 +100,8 @@ pub struct AdjacencyLruCache {
     capacity: usize,
     byte_capacity: Option<usize>,
     current_bytes: usize,
+    policy: EvictionPolicy,
+    sequence: u64,
 
     locations: HashMap<u64, usize>,
     nodes: Vec<Option<CacheNode>>,
@@ -102,7 +116,7 @@ pub struct AdjacencyLruCache {
 
 impl AdjacencyLruCache {
     pub fn new(capacity: usize) -> Result<Self, String> {
-        Self::build(capacity, None)
+        Self::build(capacity, None, EvictionPolicy::Lru)
     }
 
     pub fn new_with_byte_capacity(capacity: usize, byte_capacity: usize) -> Result<Self, String> {
@@ -110,10 +124,30 @@ impl AdjacencyLruCache {
             return Err("Cache byte capacity must be greater than zero".to_string());
         }
 
-        Self::build(capacity, Some(byte_capacity))
+        Self::build(capacity, Some(byte_capacity), EvictionPolicy::Lru)
     }
 
-    fn build(capacity: usize, byte_capacity: Option<usize>) -> Result<Self, String> {
+    pub fn new_with_policy(capacity: usize, policy: EvictionPolicy) -> Result<Self, String> {
+        Self::build(capacity, None, policy)
+    }
+
+    pub fn new_with_policy_and_byte_capacity(
+        capacity: usize,
+        byte_capacity: usize,
+        policy: EvictionPolicy,
+    ) -> Result<Self, String> {
+        if byte_capacity == 0 {
+            return Err("Cache byte capacity must be greater than zero".to_string());
+        }
+
+        Self::build(capacity, Some(byte_capacity), policy)
+    }
+
+    fn build(
+        capacity: usize,
+        byte_capacity: Option<usize>,
+        policy: EvictionPolicy,
+    ) -> Result<Self, String> {
         if capacity == 0 {
             return Err("Cache capacity must be greater than zero".to_string());
         }
@@ -122,12 +156,20 @@ impl AdjacencyLruCache {
             capacity,
             byte_capacity,
             current_bytes: 0,
+            policy,
+            sequence: 0,
             locations: HashMap::with_capacity(capacity),
             nodes: Vec::with_capacity(capacity),
             free_indices: Vec::new(),
             head: None,
             tail: None,
         })
+    }
+
+    fn next_sequence(&mut self) -> u64 {
+        let current = self.sequence;
+        self.sequence = self.sequence.saturating_add(1);
+        current
     }
 
     fn estimate_entry_size(adjacency_list: &[u64]) -> usize {
@@ -209,10 +251,15 @@ impl AdjacencyLruCache {
         adjacency_list: Vec<u64>,
         estimated_size_bytes: usize,
     ) -> usize {
+        let sequence = self.next_sequence();
+
         let node = CacheNode {
             user_id,
             adjacency_list,
             estimated_size_bytes,
+            frequency: 1,
+            inserted_at: sequence,
+            last_accessed_at: sequence,
             previous: None,
             next: None,
         };
@@ -222,6 +269,7 @@ impl AdjacencyLruCache {
                 self.nodes[index] = Some(node);
                 index
             }
+
             None => {
                 self.nodes.push(Some(node));
                 self.nodes.len() - 1
@@ -258,10 +306,40 @@ impl AdjacencyLruCache {
 
         let adjacency_list = self.nodes[index].as_ref()?.adjacency_list.clone();
 
-        self.detach(index);
-        self.attach_as_most_recent(index);
+        let sequence = self.next_sequence();
+
+        {
+            let node = self.nodes[index].as_mut()?;
+
+            node.frequency = node.frequency.saturating_add(1);
+            node.last_accessed_at = sequence;
+        }
+
+        if self.policy == EvictionPolicy::Lru {
+            self.detach(index);
+            self.attach_as_most_recent(index);
+        }
 
         Some(adjacency_list)
+    }
+
+    fn eviction_candidate(&self) -> usize {
+        match self.policy {
+            EvictionPolicy::Lru | EvictionPolicy::Fifo => {
+                self.head.expect("Non-empty cache must contain a head node")
+            }
+
+            EvictionPolicy::Lfu => self
+                .locations
+                .values()
+                .copied()
+                .min_by_key(|index| {
+                    let node = self.nodes[*index].as_ref().expect("Cache node must exist");
+
+                    (node.frequency, node.last_accessed_at, node.inserted_at)
+                })
+                .expect("Non-empty cache must contain an LFU candidate"),
+        }
     }
 
     pub fn insert(&mut self, user_id: u64, adjacency_list: Vec<u64>) {
@@ -283,11 +361,8 @@ impl AdjacencyLruCache {
         while self.locations.len() >= self.capacity
             || self.would_exceed_byte_capacity(estimated_size_bytes)
         {
-            let least_recently_used = self
-                .head
-                .expect("Cache requiring eviction must contain a head");
-
-            self.remove_node(least_recently_used);
+            let victim = self.eviction_candidate();
+            self.remove_node(victim);
         }
 
         self.allocate_node(user_id, adjacency_list, estimated_size_bytes);
@@ -321,6 +396,10 @@ impl AdjacencyLruCache {
 
     pub fn byte_capacity(&self) -> Option<usize> {
         self.byte_capacity
+    }
+
+    pub fn policy(&self) -> EvictionPolicy {
+        self.policy
     }
 
     pub fn capacity(&self) -> usize {
@@ -405,6 +484,79 @@ mod tests {
         assert!(cache.contains(3));
         assert!(cache.contains(4));
         assert_eq!(cache.len(), 3);
+    }
+
+    #[test]
+    fn fifo_does_not_promote_entry_after_read() {
+        let mut cache = AdjacencyLruCache::new_with_policy(2, EvictionPolicy::Fifo).unwrap();
+
+        cache.insert(1, vec![10]);
+        cache.insert(2, vec![20]);
+
+        assert_eq!(cache.get(1), Some(vec![10]));
+
+        cache.insert(3, vec![30]);
+
+        assert!(!cache.contains(1));
+        assert!(cache.contains(2));
+        assert!(cache.contains(3));
+    }
+
+    #[test]
+    fn lru_promotes_entry_after_read() {
+        let mut cache = AdjacencyLruCache::new_with_policy(2, EvictionPolicy::Lru).unwrap();
+
+        cache.insert(1, vec![10]);
+        cache.insert(2, vec![20]);
+
+        assert_eq!(cache.get(1), Some(vec![10]));
+
+        cache.insert(3, vec![30]);
+
+        assert!(cache.contains(1));
+        assert!(!cache.contains(2));
+        assert!(cache.contains(3));
+    }
+
+    #[test]
+    fn lfu_evicts_least_frequently_used_entry() {
+        let mut cache = AdjacencyLruCache::new_with_policy(2, EvictionPolicy::Lfu).unwrap();
+
+        cache.insert(1, vec![10]);
+        cache.insert(2, vec![20]);
+
+        assert_eq!(cache.get(1), Some(vec![10]));
+        assert_eq!(cache.get(1), Some(vec![10]));
+
+        cache.insert(3, vec![30]);
+
+        assert!(cache.contains(1));
+        assert!(!cache.contains(2));
+        assert!(cache.contains(3));
+    }
+
+    #[test]
+    fn cache_policy_works_with_byte_capacity() {
+        let entry_size = AdjacencyLruCache::estimate_entry_size(&[10]);
+
+        let mut cache = AdjacencyLruCache::new_with_policy_and_byte_capacity(
+            10,
+            entry_size * 2,
+            EvictionPolicy::Fifo,
+        )
+        .unwrap();
+
+        cache.insert(1, vec![10]);
+        cache.insert(2, vec![20]);
+
+        assert_eq!(cache.get(1), Some(vec![10]));
+
+        cache.insert(3, vec![30]);
+
+        assert!(!cache.contains(1));
+        assert!(cache.contains(2));
+        assert!(cache.contains(3));
+        assert!(cache.current_bytes() <= entry_size * 2);
     }
 
     #[test]
