@@ -231,7 +231,72 @@ The project retains an earlier ID-only cache simulator for comparison. Actual ca
 
 ---
 
-## Graph model
+## Replication, splitting, rebalancing, persistence, and scaling
+
+### Hub replication
+
+Workload: 10,000 users, 100 hubs, 8 edges per user, 2 hub-targeting edges per user, 4 shards, LRU cache capacity 100 per shard.
+
+After replicating the 100 hub users across all shards, queries can read hub adjacency lists from the local shard instead of crossing to the home shard.
+
+| Metric | No replication | With replication | Change |
+|---|---:|---:|---:|
+| Cross-shard hops | 541,090 | 403,606 | -25.41% |
+| Cache hit rate | 19.45% | 8.06% | -11.39 pp |
+
+Replication reduced cross-shard hops by **25.41%**. The cache hit rate decreased because replicated hubs are now served from multiple shards' caches, spreading the cache capacity. The primary benefit is reduced inter-shard communication, not cache performance.
+
+### Community splitting
+
+When communities exceed a configurable size limit, the splitting algorithm divides them into chunks distributed across shards. This benchmark compares splitting against hash and community placement on uneven community sizes `[4000, 2500, 1500, 1000, 1000]` with max chunk size 2,000:
+
+| Strategy | Users per shard | Imbalance | Avg hops |
+|---|---|---:|---:|
+| Hash | [2500, 2500, 2500, 2500] | 0.00% | 53.97 |
+| Naive community | [5000, 2500, 1500, 1000] | 100.00% | 8.02 |
+| Balanced community | [4000, 2500, 1500, 2000] | 60.00% | 8.79 |
+
+Splitting keeps small communities intact and distributes large-community chunks across shards. The trade-off: split chunks break community locality, increasing cross-shard hops compared to keeping the community whole.
+
+### Dynamic shard rebalancing
+
+The rebalancing algorithm detects overloaded shards and migrates users to improve distribution. Starting from the naive community placement on `[4000, 2500, 1500, 1000, 1000]`:
+
+| Phase | Users per shard | Edges per shard | User imbalance | Edge imbalance |
+|---|---|---|---:|---:|
+| Before | [5000, 2500, 1500, 1000] | [40000, 20000, 12000, 8000] | 100.00% | 100.00% |
+| After | [2625, 2500, 2438, 2437] | [21000, 20000, 19504, 19496] | 5.00% | 5.00% |
+
+2,375 users and 19,000 edges were moved. User and edge imbalance dropped from 100% to 5%.
+
+### Persistence
+
+Snapshot and recovery timing on a 10,000-user, 80,000-edge graph across 4 shards:
+
+| Operation | Time | Users |
+|---|---:|---:|
+| create_snapshot | 2,745 µs | 10,000 |
+| save_snapshot | 6,981 µs | 10,000 |
+| load_snapshot | 11,611 µs | 10,000 |
+| restore_from_snapshot | 13,223 µs | 10,000 |
+| verify_recovery | 4,625 µs | 10,000 |
+| **total** | **39,187 µs** | **10,000** |
+
+Full snapshot-save-load-restore-verify cycle completes in ~39 ms for a 10K-user graph.
+
+### Scaling
+
+Hash vs community placement across increasing user counts (8 edges per user, 7 local, 4 shards):
+
+| Users | Hash avg hops | Community avg hops | Hash req reduction | Community req reduction |
+|---:|---:|---:|---:|---:|
+| 1,000 | 54.27 | 9.00 | 48.67% | 66.67% |
+| 5,000 | 54.24 | 8.13 | 48.99% | 67.76% |
+| 10,000 | 54.02 | 7.46 | 48.83% | 68.57% |
+| 50,000 | 53.95 | 6.87 | 48.85% | 69.29% |
+| 100,000 | 54.04 | 6.81 | 48.84% | 69.37% |
+
+Community placement's average hops decrease as the graph scales (9.00 → 6.81), while hash placement stays flat (~54). The locality advantage grows with graph size.
 
 Users are graph nodes. A directed `FOLLOWS` relationship is an edge:
 
@@ -344,7 +409,7 @@ Every sharded query is checked against a normal, non-sharded reference graph:
 4. Sort the result sets.
 5. Confirm that all results match.
 
-The benchmark stops if any strategy returns an incorrect answer. The current test suite contains **28 passing tests**.
+The benchmark stops if any strategy returns an incorrect answer. The current test suite contains **117 passing tests**.
 
 ## Metrics
 
@@ -389,6 +454,11 @@ Current benchmark families:
 4. **Hub-heavy workload** — a small set of hub users receives a large share of incoming edges and repeated adjacency reads.
 5. **Cold-cache sweep** — the hub-heavy access stream replayed through bounded LRU caches with capacities from 25 to 1,000.
 6. **Cache-warming sweep** — the same access stream tested with caches preloaded using the most-followed hubs.
+7. **Replication benchmark** — compares cross-shard hops with and without hub replication.
+8. **Splitting benchmark** — compares hash, naive community, balanced community, and split placement on uneven communities.
+9. **Rebalance benchmark** — measures distribution improvement before and after dynamic rebalancing.
+10. **Persistence benchmark** — times snapshot creation, save, load, restore, and verification.
+11. **Scaling sweep** — sweeps user counts from 1K to 100K comparing hash vs community placement.
 
 
 ---
@@ -439,6 +509,11 @@ results/cache_warming.csv
 results/real_sharded_cache.csv
 results/real_sharded_cache_warming.csv
 results/distributed_latency.csv
+results/replication.csv
+results/splitting.csv
+results/rebalance.csv
+results/persistence.csv
+results/scaling.csv
 ```
 
 Generated charts:
@@ -614,9 +689,9 @@ cargo run --release --bin cache_policy_benchmark
 ## Future work
 
 * Production distributed network transport
-* Persistent storage with crash recovery
 * Dynamic shard rebalancing triggers
 * Cross-datacenter replication
+* Shard-aware community splitting (currently splits in round-robin, not considering shard load)
 
 ## Conclusion
 

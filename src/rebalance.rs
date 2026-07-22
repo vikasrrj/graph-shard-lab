@@ -46,10 +46,8 @@ pub fn compute_rebalance_plan(graph: &ShardedGraph, max_improvement: f64) -> Res
         if (*shard_user_count as f64) > avg_users * 1.1 {
             let shard = &graph.shards[shard_id];
 
-            for user_id in 1..=100_000 {
-                if shard.get_user(user_id).is_some() {
-                    candidates.push((user_id, shard_id));
-                }
+            for user_id in shard.user_ids() {
+                candidates.push((user_id, shard_id));
             }
         }
     }
@@ -142,11 +140,17 @@ pub fn apply_rebalance_plan(
 
         let _ = graph.shards[from_shard].remove_follow_unchecked(user_id, user_id);
 
+        graph.shards[from_shard].remove_user(user_id);
+
+        graph.invalidate_cached_adjacency(from_shard, user_id);
+
         graph.shards[action.to_shard].add_user(user_id, &user_name)?;
 
         for &target in &adjacency_list {
             graph.shards[action.to_shard].add_follow_unchecked(user_id, target)?;
         }
+
+        graph.invalidate_cached_adjacency(action.to_shard, user_id);
 
         total_edges_moved += adjacency_list.len();
     }

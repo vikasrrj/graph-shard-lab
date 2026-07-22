@@ -71,10 +71,20 @@ impl ShardedGraph {
             .try_shard_for(user_id)
             .ok_or(GraphError::ShardNotFound(user_id))?;
 
+        let adjacency_list = self.shards[home_shard].get_following_ids(user_id).to_vec();
+
         for shard_id in 0..self.shards.len() {
             if shard_id == home_shard {
                 continue;
             }
+
+            for &target in &adjacency_list {
+                let _ = self.shards[shard_id].remove_follow_unchecked(user_id, target);
+            }
+
+            let _ = self.shards[shard_id].remove_follow_unchecked(user_id, user_id);
+
+            let _ = self.shards[shard_id].remove_user(user_id);
 
             if let Some(caches) = self.caches.as_mut() {
                 caches[shard_id].invalidate(user_id);
@@ -271,6 +281,28 @@ mod tests {
 
         graph.unreplicate_user(1).unwrap();
         assert!(!graph.is_replicated(1));
+
+        let home_shard = graph.shard_for(1);
+        let home_adjacency = graph.shards[home_shard].get_following_ids(1).to_vec();
+
+        for shard_id in 0..graph.shard_count() {
+            if shard_id == home_shard {
+                continue;
+            }
+            assert!(
+                graph.shards[shard_id].get_user(1).is_none(),
+                "User 1 should be removed from shard {shard_id}"
+            );
+            assert!(
+                graph.shards[shard_id].get_following_ids(1).is_empty(),
+                "Adjacency list for user 1 should be empty on shard {shard_id}"
+            );
+        }
+
+        assert_eq!(
+            graph.shards[home_shard].get_following_ids(1),
+            &home_adjacency
+        );
     }
 
     #[test]

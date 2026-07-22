@@ -426,6 +426,19 @@ impl ShardedGraph {
             .unwrap_or_else(|| panic!("User ID {user_id} is outside the configured placement"))
     }
 
+    pub(crate) fn shard_for_user_local_first(
+        &self,
+        user_id: u64,
+        requesting_shard: usize,
+    ) -> Option<usize> {
+        if self.replicated_users.contains(&user_id)
+            && self.shards[requesting_shard].get_user(user_id).is_some()
+        {
+            return Some(requesting_shard);
+        }
+        self.try_shard_for(user_id)
+    }
+
     pub fn placement_for_user(&self, user_id: u64) -> usize {
         self.shard_for(user_id)
     }
@@ -607,7 +620,8 @@ impl ShardedGraph {
         touched_shards.insert(source_shard);
 
         for first_hop in first_hops {
-            let Some(first_hop_shard) = self.try_shard_for(first_hop) else {
+            let Some(first_hop_shard) = self.shard_for_user_local_first(first_hop, source_shard)
+            else {
                 continue;
             };
 
@@ -655,7 +669,9 @@ impl ShardedGraph {
             };
 
             for &second_hop in second_hops.iter() {
-                let Some(second_hop_shard) = self.try_shard_for(second_hop) else {
+                let Some(second_hop_shard) =
+                    self.shard_for_user_local_first(second_hop, first_hop_shard)
+                else {
                     continue;
                 };
 
@@ -770,6 +786,79 @@ impl ShardedGraph {
     pub fn edges_per_shard(&self) -> Vec<usize> {
         self.shards.iter().map(Graph::edge_count).collect()
     }
+
+    pub fn user_ids_per_shard(&self) -> Vec<Vec<u64>> {
+        self.shards.iter().map(Graph::user_ids).collect()
+    }
+
+    pub fn placement_info(&self) -> String {
+        match &self.placement {
+            Placement::Hash => "Hash".to_string(),
+            Placement::Community { community_size } => {
+                format!("Community:{community_size}")
+            }
+            Placement::BalancedCommunity {
+                community_sizes,
+                community_to_shard,
+            } => {
+                let sizes: Vec<String> = community_sizes.iter().map(|s| s.to_string()).collect();
+                let assignments: Vec<String> =
+                    community_to_shard.iter().map(|s| s.to_string()).collect();
+                format!(
+                    "BalancedCommunity:{}:{}",
+                    sizes.join(","),
+                    assignments.join(",")
+                )
+            }
+        }
+    }
+}
+
+pub fn parse_placement_info(info: &str) -> Result<Placement> {
+    if info == "Hash" {
+        return Ok(Placement::Hash);
+    }
+
+    if let Some(size_str) = info.strip_prefix("Community:") {
+        let community_size: u64 = size_str
+            .parse()
+            .map_err(|e| GraphError::IoError(format!("Invalid community size: {e}")))?;
+        return Ok(Placement::Community { community_size });
+    }
+
+    if let Some(rest) = info.strip_prefix("BalancedCommunity:") {
+        let parts: Vec<&str> = rest.split(':').collect();
+        if parts.len() != 2 {
+            return Err(GraphError::IoError(
+                "Invalid BalancedCommunity format".to_string(),
+            ));
+        }
+
+        let community_sizes: Vec<u64> = parts[0]
+            .split(',')
+            .map(|s| {
+                s.parse()
+                    .map_err(|e| GraphError::IoError(format!("Invalid community size: {e}")))
+            })
+            .collect::<Result<Vec<u64>>>()?;
+
+        let community_to_shard: Vec<usize> = parts[1]
+            .split(',')
+            .map(|s| {
+                s.parse()
+                    .map_err(|e| GraphError::IoError(format!("Invalid shard assignment: {e}")))
+            })
+            .collect::<Result<Vec<usize>>>()?;
+
+        return Ok(Placement::BalancedCommunity {
+            community_sizes,
+            community_to_shard,
+        });
+    }
+
+    Err(GraphError::IoError(format!(
+        "Unknown placement type: {info}"
+    )))
 }
 
 #[cfg(test)]

@@ -59,6 +59,10 @@ impl Graph {
         Ok(())
     }
 
+    pub fn remove_user(&mut self, id: u64) -> bool {
+        self.users.remove(&id).is_some()
+    }
+
     pub fn add_follow(&mut self, source: u64, target: u64) -> Result<()> {
         if !self.users.contains_key(&source) {
             return Err(GraphError::SourceUserNotFound(source));
@@ -191,6 +195,10 @@ impl Graph {
 
     pub fn edge_count(&self) -> usize {
         self.follows.values().map(Vec::len).sum()
+    }
+
+    pub fn user_ids(&self) -> Vec<u64> {
+        self.users.keys().copied().collect()
     }
 }
 

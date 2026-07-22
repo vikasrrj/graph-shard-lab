@@ -1,0 +1,3 @@
+strategy,cache_hits,cache_misses,hit_rate_percent,cross_shard_hops,shard_requests,replicated_users,replicated_edges
+no_replication,15561,64439,19.45,541090,90000,0,0
+with_replication,6446,73554,8.06,403606,90000,100,2400

@@ -1,0 +1,7 @@
+operation,time_us,user_count,edge_count,shard_count
+create_snapshot,2745, 10000,80000,4
+save_snapshot,6981, 10000,80000,4
+load_snapshot,11611, 10000,80000,4
+restore_from_snapshot,13223, 10000,80000,4
+verify_recovery,4625, 10000,80000,4
+total,39187, 10000,80000,4

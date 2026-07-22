@@ -1,13 +1,18 @@
 use std::{
-    fs::{File, create_dir_all},
+    fs::{self, File, create_dir_all},
     io::{BufWriter, Write},
+    time::Instant,
 };
 
 use graph_shard_lab::{
     Graph,
     cache::IdLruSimulator,
     error::{GraphError, Result},
+    persistence::{
+        create_snapshot, load_snapshot, restore_from_snapshot, save_snapshot, verify_recovery,
+    },
     sharded::{Placement, QueryResult, ShardedGraph},
+    splitting::create_split_placement,
     uneven::generate_uneven_community_workload,
     workload::{
         CommunityWorkload, HubWorkload, generate_community_workload, generate_hub_workload,
@@ -69,6 +74,11 @@ fn main() -> Result<()> {
     run_hotspot_cache_warming_benchmark()?;
     run_real_sharded_cache_benchmark()?;
     run_real_sharded_cache_warming_benchmark()?;
+    run_replication_benchmark()?;
+    run_splitting_benchmark()?;
+    run_rebalance_benchmark()?;
+    run_persistence_benchmark()?;
+    run_scaling_benchmark()?;
 
     Ok(())
 }
@@ -1005,6 +1015,611 @@ fn run_real_sharded_cache_warming_benchmark() -> Result<()> {
             warmed_hit_rate,
             cold_startup_rate,
             warmed_startup_rate,
+        ));
+    }
+
+    bench.flush()?;
+
+    Ok(())
+}
+
+fn run_replication_benchmark() -> Result<()> {
+    let workload = generate_hub_workload(
+        USER_COUNT,
+        HUB_COUNT,
+        EDGES_PER_USER,
+        HUB_EDGES_PER_USER,
+        SEED,
+    )?;
+
+    let _reference = build_hub_reference_graph(&workload)?;
+
+    let mut graph = build_cached_hub_sharded_graph(&workload, 100)?;
+
+    println!(
+        "\nReplication vs non-replication on hub-heavy workload\n\
+         Users: {USER_COUNT}\n\
+         Hubs: {HUB_COUNT}\n\
+         Edges per user: {EDGES_PER_USER}\n\
+         Hub edges per user: {HUB_EDGES_PER_USER}\n\
+         Cache capacity per shard: 100\n\
+         Seed: {SEED}\n"
+    );
+
+    let mut total_hits_no_replication = 0_usize;
+    let mut total_misses_no_replication = 0_usize;
+    let mut total_cross_hops_no_replication = 0_usize;
+    let mut total_shard_requests_no_replication = 0_usize;
+
+    for source in 1..=workload.user_count {
+        let cached = graph.get_two_hop_with_cache_stats(source)?;
+        total_hits_no_replication += cached.cache_hits;
+        total_misses_no_replication += cached.cache_misses;
+        total_cross_hops_no_replication += cached.cross_shard_hops;
+        total_shard_requests_no_replication += cached.shard_requests;
+    }
+
+    let replication_stats = graph.auto_replicate_hubs(&workload.hub_ids)?;
+
+    let mut total_hits_replication = 0_usize;
+    let mut total_misses_replication = 0_usize;
+    let mut total_cross_hops_replication = 0_usize;
+    let mut total_shard_requests_replication = 0_usize;
+
+    for source in 1..=workload.user_count {
+        let cached = graph.get_two_hop_with_cache_stats(source)?;
+        total_hits_replication += cached.cache_hits;
+        total_misses_replication += cached.cache_misses;
+        total_cross_hops_replication += cached.cross_shard_hops;
+        total_shard_requests_replication += cached.shard_requests;
+    }
+
+    let no_rep_total = total_hits_no_replication + total_misses_no_replication;
+    let rep_total = total_hits_replication + total_misses_replication;
+
+    let no_rep_hit_rate = percentage(total_hits_no_replication as u64, no_rep_total as u64);
+    let rep_hit_rate = percentage(total_hits_replication as u64, rep_total as u64);
+
+    let cross_hop_reduction = percentage_reduction(
+        total_cross_hops_no_replication as f64,
+        total_cross_hops_replication as f64,
+    );
+
+    let request_reduction = percentage_reduction(
+        total_shard_requests_no_replication as f64,
+        total_shard_requests_replication as f64,
+    );
+
+    println!(
+        "{:<18} {:>14} {:>14} {:>12} {:>14} {:>14}",
+        "Strategy", "Cache hits", "Cache misses", "Hit rate", "Cross hops", "Shard reqs",
+    );
+
+    println!("{}", "-".repeat(90));
+
+    println!(
+        "{:<18} {:>14} {:>14} {:>11.2}% {:>14} {:>14}",
+        "No replication",
+        total_hits_no_replication,
+        total_misses_no_replication,
+        no_rep_hit_rate,
+        total_cross_hops_no_replication,
+        total_shard_requests_no_replication,
+    );
+
+    println!(
+        "{:<18} {:>14} {:>14} {:>11.2}% {:>14} {:>14}",
+        "With replication",
+        total_hits_replication,
+        total_misses_replication,
+        rep_hit_rate,
+        total_cross_hops_replication,
+        total_shard_requests_replication,
+    );
+
+    println!();
+    println!("Replicated users: {}", replication_stats.replicated_users);
+    println!(
+        "Replicated edges: {}",
+        replication_stats.total_replicated_edges
+    );
+    println!("Cross-shard hop reduction: {cross_hop_reduction:.2}%");
+    println!("Shard request reduction: {request_reduction:.2}%");
+
+    let mut bench = Benchmark::new(
+        "results/replication.csv",
+        "strategy,cache_hits,cache_misses,hit_rate_percent,\
+         cross_shard_hops,shard_requests,\
+         replicated_users,replicated_edges",
+    );
+
+    bench.add_csv_row(format!(
+        "no_replication,{},{},{:.2},{},{},0,0",
+        total_hits_no_replication,
+        total_misses_no_replication,
+        no_rep_hit_rate,
+        total_cross_hops_no_replication,
+        total_shard_requests_no_replication,
+    ));
+
+    bench.add_csv_row(format!(
+        "with_replication,{},{},{:.2},{},{},{},{}",
+        total_hits_replication,
+        total_misses_replication,
+        rep_hit_rate,
+        total_cross_hops_replication,
+        total_shard_requests_replication,
+        replication_stats.replicated_users,
+        replication_stats.total_replicated_edges,
+    ));
+
+    bench.flush()?;
+
+    Ok(())
+}
+
+fn run_splitting_benchmark() -> Result<()> {
+    let sizes = UNEVEN_COMMUNITY_SIZES;
+
+    println!(
+        "\nSplitting vs non-splitting on uneven communities\n\
+         Community sizes: {sizes:?}\n\
+         Edges per user: {EDGES_PER_USER}\n\
+         Local edges per user: {UNEVEN_LOCAL_EDGES}\n\
+         Shards: {SHARD_COUNT}\n\
+         Seed: {SEED}\n"
+    );
+
+    let workload =
+        generate_uneven_community_workload(&sizes, EDGES_PER_USER, UNEVEN_LOCAL_EDGES, SEED)?;
+
+    let reference = build_reference_graph(&workload)?;
+
+    let hash_graph = build_sharded_graph(&workload, Placement::Hash)?;
+
+    let naive_assignment: Vec<usize> = (0..sizes.len())
+        .map(|community_id| community_id % SHARD_COUNT)
+        .collect();
+
+    let naive_graph = build_sharded_graph(
+        &workload,
+        Placement::BalancedCommunity {
+            community_sizes: sizes.to_vec(),
+            community_to_shard: naive_assignment,
+        },
+    )?;
+
+    let balanced_graph = build_balanced_graph(&workload, sizes.to_vec())?;
+
+    let split_placement = create_split_placement(&sizes, SHARD_COUNT, 2000)?;
+    let split_graph = build_sharded_graph(&workload, split_placement)?;
+
+    let hash_stats = validate_and_measure(&reference, &hash_graph, workload.user_count)?;
+    let naive_stats = validate_and_measure(&reference, &naive_graph, workload.user_count)?;
+    let balanced_stats = validate_and_measure(&reference, &balanced_graph, workload.user_count)?;
+    let split_stats = validate_and_measure(&reference, &split_graph, workload.user_count)?;
+
+    println!(
+        "{:<22} {:<28} {:>14} {:>14} {:>12} {:>12}",
+        "Strategy", "Users per shard", "User imbalance", "Avg hops", "Direct reqs", "Batched reqs",
+    );
+
+    println!("{}", "-".repeat(110));
+
+    print_strategy_result("Hash", &hash_graph, &hash_stats);
+    print_strategy_result("Naive community", &naive_graph, &naive_stats);
+    print_strategy_result("Balanced community", &balanced_graph, &balanced_stats);
+    print_strategy_result("Split (max 2000)", &split_graph, &split_stats);
+
+    let mut bench = Benchmark::new(
+        "results/splitting.csv",
+        "strategy,average_cross_shard_hops,average_shards_touched,\
+         user_imbalance_percent,edge_imbalance_percent,\
+         direct_shard_requests,batched_shard_requests,\
+         request_reduction_percent",
+    );
+
+    bench.add_csv_row(strategy_csv_row("hash", &hash_graph, &hash_stats));
+    bench.add_csv_row(strategy_csv_row(
+        "naive_community",
+        &naive_graph,
+        &naive_stats,
+    ));
+    bench.add_csv_row(strategy_csv_row(
+        "balanced_community",
+        &balanced_graph,
+        &balanced_stats,
+    ));
+    bench.add_csv_row(strategy_csv_row("split_2000", &split_graph, &split_stats));
+
+    bench.flush()?;
+
+    Ok(())
+}
+
+fn run_rebalance_benchmark() -> Result<()> {
+    let sizes = UNEVEN_COMMUNITY_SIZES;
+
+    println!(
+        "\nRebalancing before and after\n\
+         Community sizes: {sizes:?}\n\
+         Edges per user: {EDGES_PER_USER}\n\
+         Local edges per user: {UNEVEN_LOCAL_EDGES}\n\
+         Shards: {SHARD_COUNT}\n\
+         Seed: {SEED}\n"
+    );
+
+    let workload =
+        generate_uneven_community_workload(&sizes, EDGES_PER_USER, UNEVEN_LOCAL_EDGES, SEED)?;
+
+    let reference = build_reference_graph(&workload)?;
+
+    let naive_assignment: Vec<usize> = (0..sizes.len())
+        .map(|community_id| community_id % SHARD_COUNT)
+        .collect();
+
+    let mut graph = build_sharded_graph(
+        &workload,
+        Placement::BalancedCommunity {
+            community_sizes: sizes.to_vec(),
+            community_to_shard: naive_assignment,
+        },
+    )?;
+
+    let _before_stats = validate_and_measure(&reference, &graph, workload.user_count)?;
+    let before_counts = graph.users_per_shard();
+    let before_edge_counts = graph.edges_per_shard();
+    let before_imbalance = imbalance_percentage(&before_counts);
+    let before_edge_imbalance = imbalance_percentage(&before_edge_counts);
+
+    let rebalance_plan = graph_shard_lab::rebalance::compute_rebalance_plan(&graph, 5.0)?;
+
+    let rebalance_stats =
+        graph_shard_lab::rebalance::apply_rebalance_plan(&mut graph, &rebalance_plan)?;
+
+    let after_counts = graph.users_per_shard();
+    let after_edge_counts = graph.edges_per_shard();
+    let after_imbalance = imbalance_percentage(&after_counts);
+    let after_edge_imbalance = imbalance_percentage(&after_edge_counts);
+
+    println!(
+        "{:<12} {:<28} {:<28} {:>14} {:>14} {:>12}",
+        "Phase",
+        "Users per shard",
+        "Edges per shard",
+        "User imbalance",
+        "Edge imbalance",
+        "Users moved",
+    );
+
+    println!("{}", "-".repeat(114));
+
+    let before_text = format!("{before_counts:?}");
+    let before_edge_text = format!("{before_edge_counts:?}");
+    println!(
+        "{:<12} {:<28} {:<28} {:>13.2}% {:>14.2}% {:>12}",
+        "Before", before_text, before_edge_text, before_imbalance, before_edge_imbalance, 0,
+    );
+
+    let after_text = format!("{after_counts:?}");
+    let after_edge_text = format!("{after_edge_counts:?}");
+    println!(
+        "{:<12} {:<28} {:<28} {:>13.2}% {:>14.2}% {:>12}",
+        "After",
+        after_text,
+        after_edge_text,
+        after_imbalance,
+        after_edge_imbalance,
+        rebalance_stats.users_moved,
+    );
+
+    println!();
+    println!("Users moved: {}", rebalance_stats.users_moved);
+    println!("Edges moved: {}", rebalance_stats.edges_moved);
+    println!(
+        "User imbalance: {:.2}% -> {:.2}%",
+        rebalance_stats.initial_imbalance, rebalance_stats.final_imbalance
+    );
+    println!("Edge imbalance: {before_edge_imbalance:.2}% -> {after_edge_imbalance:.2}%");
+
+    let mut bench = Benchmark::new(
+        "results/rebalance.csv",
+        "phase,users_per_shard,edges_per_shard,user_imbalance_percent,\
+         edge_imbalance_percent,users_moved,edges_moved",
+    );
+
+    bench.add_csv_row(format!(
+        "before,\"{}\",\"{}\",{:.2},{:.2},0,0",
+        before_text.replace('"', "'"),
+        before_edge_text.replace('"', "'"),
+        before_imbalance,
+        before_edge_imbalance,
+    ));
+
+    bench.add_csv_row(format!(
+        "after,\"{}\",\"{}\",{:.2},{:.2},{},{}",
+        after_text.replace('"', "'"),
+        after_edge_text.replace('"', "'"),
+        after_imbalance,
+        after_edge_imbalance,
+        rebalance_stats.users_moved,
+        rebalance_stats.edges_moved,
+    ));
+
+    bench.flush()?;
+
+    Ok(())
+}
+
+fn run_persistence_benchmark() -> Result<()> {
+    println!(
+        "\nPersistence overhead benchmark\n\
+         Users: {USER_COUNT}\n\
+         Communities: {COMMUNITY_COUNT}\n\
+         Edges per user: {EDGES_PER_USER}\n\
+         Shards: {SHARD_COUNT}\n\
+         Seed: {SEED}\n"
+    );
+
+    let community_size = USER_COUNT / COMMUNITY_COUNT;
+
+    let workload =
+        generate_community_workload(USER_COUNT, COMMUNITY_COUNT, EDGES_PER_USER, 7, SEED)?;
+
+    let graph = build_sharded_graph(&workload, Placement::Community { community_size })?;
+
+    println!(
+        "Graph: {} users, {} edges across {} shards",
+        graph.user_count(),
+        graph.edge_count(),
+        graph.shard_count(),
+    );
+
+    let dir = std::env::temp_dir().join("graph_shard_bench");
+    fs::create_dir_all(&dir).map_err(|e| GraphError::IoError(e.to_string()))?;
+    let snapshot_path = dir.join("benchmark_snapshot.txt");
+
+    let start = Instant::now();
+    let snapshot = create_snapshot(&graph, 1);
+    let create_time = start.elapsed();
+
+    let start = Instant::now();
+    save_snapshot(&snapshot, &snapshot_path)?;
+    let save_time = start.elapsed();
+
+    let start = Instant::now();
+    let loaded = load_snapshot(&snapshot_path)?;
+    let load_time = start.elapsed();
+
+    let start = Instant::now();
+    let restored = restore_from_snapshot(&loaded)?;
+    let restore_time = start.elapsed();
+
+    let start = Instant::now();
+    verify_recovery(&graph, &restored)?;
+    let verify_time = start.elapsed();
+
+    let total_time = create_time + save_time + load_time + restore_time + verify_time;
+
+    println!("{:<24} {:>12} {:>10}", "Operation", "Time", "Users",);
+
+    println!("{}", "-".repeat(50));
+
+    println!(
+        "{:<24} {:>10.1}µs {:>10}",
+        "create_snapshot",
+        create_time.as_micros(),
+        graph.user_count(),
+    );
+
+    println!(
+        "{:<24} {:>10.1}µs {:>10}",
+        "save_snapshot",
+        save_time.as_micros(),
+        graph.user_count(),
+    );
+
+    println!(
+        "{:<24} {:>10.1}µs {:>10}",
+        "load_snapshot",
+        load_time.as_micros(),
+        graph.user_count(),
+    );
+
+    println!(
+        "{:<24} {:>10.1}µs {:>10}",
+        "restore_from_snapshot",
+        restore_time.as_micros(),
+        graph.user_count(),
+    );
+
+    println!(
+        "{:<24} {:>10.1}µs {:>10}",
+        "verify_recovery",
+        verify_time.as_micros(),
+        graph.user_count(),
+    );
+
+    println!("{}", "-".repeat(50));
+
+    println!(
+        "{:<24} {:>10.1}µs {:>10}",
+        "total",
+        total_time.as_micros(),
+        graph.user_count(),
+    );
+
+    let mut bench = Benchmark::new(
+        "results/persistence.csv",
+        "operation,time_us,user_count,edge_count,shard_count",
+    );
+
+    bench.add_csv_row(format!(
+        "create_snapshot,{}, {},{},{}",
+        create_time.as_micros(),
+        graph.user_count(),
+        graph.edge_count(),
+        graph.shard_count(),
+    ));
+
+    bench.add_csv_row(format!(
+        "save_snapshot,{}, {},{},{}",
+        save_time.as_micros(),
+        graph.user_count(),
+        graph.edge_count(),
+        graph.shard_count(),
+    ));
+
+    bench.add_csv_row(format!(
+        "load_snapshot,{}, {},{},{}",
+        load_time.as_micros(),
+        graph.user_count(),
+        graph.edge_count(),
+        graph.shard_count(),
+    ));
+
+    bench.add_csv_row(format!(
+        "restore_from_snapshot,{}, {},{},{}",
+        restore_time.as_micros(),
+        graph.user_count(),
+        graph.edge_count(),
+        graph.shard_count(),
+    ));
+
+    bench.add_csv_row(format!(
+        "verify_recovery,{}, {},{},{}",
+        verify_time.as_micros(),
+        graph.user_count(),
+        graph.edge_count(),
+        graph.shard_count(),
+    ));
+
+    bench.add_csv_row(format!(
+        "total,{}, {},{},{}",
+        total_time.as_micros(),
+        graph.user_count(),
+        graph.edge_count(),
+        graph.shard_count(),
+    ));
+
+    let _ = fs::remove_file(&snapshot_path);
+
+    bench.flush()?;
+
+    Ok(())
+}
+
+fn run_scaling_benchmark() -> Result<()> {
+    let scaling_user_counts: [u64; 5] = [1_000, 5_000, 10_000, 50_000, 100_000];
+    let scaling_edges_per_user: u64 = 8;
+    let scaling_local_edges: u64 = 7;
+
+    println!(
+        "\nScaling sweep\n\
+         User counts: {scaling_user_counts:?}\n\
+         Edges per user: {scaling_edges_per_user}\n\
+         Local edges per user: {scaling_local_edges}\n\
+         Shards: {SHARD_COUNT}\n\
+         Seed: {SEED}\n"
+    );
+
+    println!(
+        "{:<12} {:>10} {:>12} {:>12} {:>14} {:>12} {:>12}",
+        "Users",
+        "Strategy",
+        "Avg hops",
+        "Shards touched",
+        "Direct reqs",
+        "Batched reqs",
+        "Req redn",
+    );
+
+    println!("{}", "-".repeat(90));
+
+    let mut bench = Benchmark::new(
+        "results/scaling.csv",
+        "user_count,strategy,average_cross_shard_hops,\
+         average_shards_touched,direct_shard_requests,\
+         batched_shard_requests,request_reduction_percent,\
+         user_imbalance_percent",
+    );
+
+    for &user_count in &scaling_user_counts {
+        let community_count = (user_count / 1000).max(2);
+        let community_size = user_count / community_count;
+
+        let workload = generate_community_workload(
+            user_count,
+            community_count,
+            scaling_edges_per_user,
+            scaling_local_edges,
+            SEED,
+        )?;
+
+        let reference = build_reference_graph(&workload)?;
+
+        let hash_graph =
+            build_sharded_graph_with_shard_count(&workload, Placement::Hash, SHARD_COUNT)?;
+
+        let community_graph = build_sharded_graph_with_shard_count(
+            &workload,
+            Placement::Community { community_size },
+            SHARD_COUNT,
+        )?;
+
+        let hash_stats = validate_and_measure(&reference, &hash_graph, user_count)?;
+        let community_stats = validate_and_measure(&reference, &community_graph, user_count)?;
+
+        let _reduction = percentage_reduction(
+            hash_stats.average_cross_shard_hops,
+            community_stats.average_cross_shard_hops,
+        );
+
+        println!(
+            "{:<12} {:>10} {:>12.2} {:>14.2} {:>14.2} {:>12.2} {:>11.2}%",
+            user_count,
+            "hash",
+            hash_stats.average_cross_shard_hops,
+            hash_stats.average_shards_touched,
+            hash_stats.average_direct_shard_requests,
+            hash_stats.average_batched_shard_requests,
+            hash_stats.request_reduction_percent,
+        );
+
+        println!(
+            "{:<12} {:>10} {:>12.2} {:>14.2} {:>14.2} {:>12.2} {:>11.2}%",
+            "",
+            "community",
+            community_stats.average_cross_shard_hops,
+            community_stats.average_shards_touched,
+            community_stats.average_direct_shard_requests,
+            community_stats.average_batched_shard_requests,
+            community_stats.request_reduction_percent,
+        );
+
+        let hash_users = hash_graph.users_per_shard();
+        let community_users = community_graph.users_per_shard();
+
+        bench.add_csv_row(format!(
+            "{},hash,{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
+            user_count,
+            hash_stats.average_cross_shard_hops,
+            hash_stats.average_shards_touched,
+            hash_stats.average_direct_shard_requests,
+            hash_stats.average_batched_shard_requests,
+            hash_stats.request_reduction_percent,
+            imbalance_percentage(&hash_users),
+        ));
+
+        bench.add_csv_row(format!(
+            "{},community,{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
+            user_count,
+            community_stats.average_cross_shard_hops,
+            community_stats.average_shards_touched,
+            community_stats.average_direct_shard_requests,
+            community_stats.average_batched_shard_requests,
+            community_stats.request_reduction_percent,
+            imbalance_percentage(&community_users),
         ));
     }
 

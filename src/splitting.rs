@@ -91,7 +91,11 @@ fn compute_split_chunks(size: u64, shard_count: usize, max_size: u64) -> Vec<Spl
     chunks
 }
 
-pub fn apply_splitting_plan(shard_count: usize, plan: &SplittingPlan) -> Result<ShardedGraph> {
+pub fn apply_splitting_plan(
+    shard_count: usize,
+    plan: &SplittingPlan,
+    edges: &[(u64, u64)],
+) -> Result<ShardedGraph> {
     let mut placement_map = Vec::new();
     let mut community_sizes = Vec::new();
 
@@ -136,6 +140,10 @@ pub fn apply_splitting_plan(shard_count: usize, plan: &SplittingPlan) -> Result<
         }
     }
 
+    for &(source, target) in edges {
+        let _ = graph.add_follow(source, target);
+    }
+
     Ok(graph)
 }
 
@@ -146,20 +154,19 @@ pub fn create_split_placement(
 ) -> Result<Placement> {
     let plan = plan_community_splitting(community_sizes, shard_count, max_community_size)?;
 
-    let community_to_shard: Vec<usize> = plan
-        .communities
-        .iter()
-        .map(|c| {
-            c.split_into
-                .first()
-                .map(|chunk| chunk.shard_id)
-                .unwrap_or(0)
-        })
-        .collect();
+    let mut pseudo_sizes = Vec::new();
+    let mut pseudo_shards = Vec::new();
+
+    for community in &plan.communities {
+        for chunk in &community.split_into {
+            pseudo_sizes.push(chunk.size);
+            pseudo_shards.push(chunk.shard_id);
+        }
+    }
 
     Ok(Placement::BalancedCommunity {
-        community_sizes: community_sizes.to_vec(),
-        community_to_shard,
+        community_sizes: pseudo_sizes,
+        community_to_shard: pseudo_shards,
     })
 }
 
@@ -208,10 +215,23 @@ mod tests {
     fn creates_valid_sharded_graph() {
         let plan = plan_community_splitting(&[100, 200, 300], 4, 500).unwrap();
 
-        let graph = apply_splitting_plan(4, &plan).unwrap();
+        let graph = apply_splitting_plan(4, &plan, &[]).unwrap();
 
         assert_eq!(graph.shard_count(), 4);
         assert!(graph.user_count() > 0);
+    }
+
+    #[test]
+    fn creates_valid_sharded_graph_with_edges() {
+        let plan = plan_community_splitting(&[4, 3, 3], 2, 500).unwrap();
+
+        let edges: Vec<(u64, u64)> = vec![(1, 2), (3, 4), (5, 6), (7, 8)];
+
+        let graph = apply_splitting_plan(2, &plan, &edges).unwrap();
+
+        assert_eq!(graph.shard_count(), 2);
+        assert_eq!(graph.user_count(), 10);
+        assert_eq!(graph.edge_count(), 4);
     }
 
     #[test]
@@ -225,6 +245,24 @@ mod tests {
         {
             assert_eq!(community_sizes.len(), 3);
             assert_eq!(community_to_shard.len(), 3);
+            let total: u64 = community_sizes.iter().sum();
+            assert_eq!(total, 600);
+        } else {
+            panic!("Expected BalancedCommunity placement");
+        }
+    }
+
+    #[test]
+    fn split_placement_flattens_chunks() {
+        let placement = create_split_placement(&[4000, 1000], 2, 2000).unwrap();
+
+        if let Placement::BalancedCommunity {
+            community_sizes,
+            community_to_shard,
+        } = placement
+        {
+            assert_eq!(community_sizes, vec![2000, 2000, 1000]);
+            assert_eq!(community_to_shard, vec![0, 1, 1]);
         } else {
             panic!("Expected BalancedCommunity placement");
         }

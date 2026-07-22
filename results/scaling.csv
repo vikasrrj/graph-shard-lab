@@ -1,0 +1,11 @@
+user_count,strategy,average_cross_shard_hops,average_shards_touched,direct_shard_requests,batched_shard_requests,request_reduction_percent,user_imbalance_percent
+1000,hash,54.27,4.00,9.00,4.62,48.67,0.00
+1000,community,9.00,2.00,9.00,3.00,66.67,100.00
+5000,hash,54.24,4.00,9.00,4.59,48.99,0.00
+5000,community,8.13,3.82,9.00,2.90,67.76,60.00
+10000,hash,54.02,4.00,9.00,4.61,48.83,0.00
+10000,community,7.46,3.80,9.00,2.83,68.57,20.00
+50000,hash,53.95,4.00,9.00,4.60,48.85,0.00
+50000,community,6.87,3.79,9.00,2.76,69.29,4.00
+100000,hash,54.04,4.00,9.00,4.60,48.84,0.00
+100000,community,6.81,3.78,9.00,2.76,69.37,0.00

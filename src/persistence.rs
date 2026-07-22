@@ -1,5 +1,5 @@
 use crate::error::{GraphError, Result};
-use crate::sharded::ShardedGraph;
+use crate::sharded::{ShardedGraph, parse_placement_info};
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
@@ -8,6 +8,7 @@ use std::path::Path;
 pub struct Snapshot {
     pub timestamp: u64,
     pub shard_count: usize,
+    pub placement_info: String,
     pub users: Vec<SnapshotUser>,
     pub edges: Vec<SnapshotEdge>,
 }
@@ -54,7 +55,7 @@ pub fn create_snapshot(graph: &ShardedGraph, timestamp: u64) -> Snapshot {
     for shard_id in 0..graph.shard_count() {
         let shard = &graph.shards[shard_id];
 
-        for user_id in 1..=100_000 {
+        for user_id in shard.user_ids() {
             if let Some(user) = shard.get_user(user_id) {
                 users.push(SnapshotUser {
                     id: user.id,
@@ -76,6 +77,7 @@ pub fn create_snapshot(graph: &ShardedGraph, timestamp: u64) -> Snapshot {
     Snapshot {
         timestamp,
         shard_count: graph.shard_count(),
+        placement_info: graph.placement_info(),
         users,
         edges,
     }
@@ -86,12 +88,15 @@ pub fn save_snapshot(snapshot: &Snapshot, path: &Path) -> Result<()> {
 
     let mut writer = BufWriter::new(file);
 
-    writeln!(writer, "SNAPSHOT v1").map_err(|e| GraphError::IoError(e.to_string()))?;
+    writeln!(writer, "SNAPSHOT v2").map_err(|e| GraphError::IoError(e.to_string()))?;
 
     writeln!(writer, "timestamp:{}", snapshot.timestamp)
         .map_err(|e| GraphError::IoError(e.to_string()))?;
 
     writeln!(writer, "shard_count:{}", snapshot.shard_count)
+        .map_err(|e| GraphError::IoError(e.to_string()))?;
+
+    writeln!(writer, "placement:{}", snapshot.placement_info)
         .map_err(|e| GraphError::IoError(e.to_string()))?;
 
     writeln!(writer, "USERS").map_err(|e| GraphError::IoError(e.to_string()))?;
@@ -132,6 +137,7 @@ pub fn load_snapshot(path: &Path) -> Result<Snapshot> {
 
     let mut timestamp = 0u64;
     let mut shard_count = 0usize;
+    let mut placement_info = String::from("Hash");
     let mut users = Vec::new();
     let mut edges = Vec::new();
 
@@ -148,6 +154,8 @@ pub fn load_snapshot(path: &Path) -> Result<Snapshot> {
             shard_count = val
                 .parse()
                 .map_err(|e| GraphError::IoError(format!("Invalid shard_count: {e}")))?;
+        } else if let Some(val) = line.strip_prefix("placement:") {
+            placement_info = val.to_string();
         } else if line == "USERS" {
             section = "users".to_string();
         } else if line == "EDGES" {
@@ -190,13 +198,16 @@ pub fn load_snapshot(path: &Path) -> Result<Snapshot> {
     Ok(Snapshot {
         timestamp,
         shard_count,
+        placement_info,
         users,
         edges,
     })
 }
 
 pub fn restore_from_snapshot(snapshot: &Snapshot) -> Result<ShardedGraph> {
-    let mut graph = ShardedGraph::new(snapshot.shard_count)?;
+    let placement = parse_placement_info(&snapshot.placement_info)?;
+
+    let mut graph = ShardedGraph::with_placement(snapshot.shard_count, placement)?;
 
     for user in &snapshot.users {
         let _ = graph.add_user(user.id, &user.name);
@@ -400,11 +411,18 @@ pub fn verify_recovery(original: &ShardedGraph, recovered: &ShardedGraph) -> Res
         )));
     }
 
-    for user_id in 1..=100_000 {
-        let orig_user = original.get_user(user_id);
-        let rec_user = recovered.get_user(user_id);
+    let mut orig_user_ids: Vec<u64> = original
+        .user_ids_per_shard()
+        .into_iter()
+        .flatten()
+        .collect();
+    orig_user_ids.sort_unstable();
 
-        if orig_user.is_some() != rec_user.is_some() {
+    for user_id in &orig_user_ids {
+        let orig_user = original.get_user(*user_id);
+        let rec_user = recovered.get_user(*user_id);
+
+        if orig_user.is_none() != rec_user.is_none() {
             return Err(GraphError::IoError(format!(
                 "User {} presence mismatch",
                 user_id
@@ -421,8 +439,8 @@ pub fn verify_recovery(original: &ShardedGraph, recovered: &ShardedGraph) -> Res
             )));
         }
 
-        let orig_edges = original.get_following_ids(user_id);
-        let rec_edges = recovered.get_following_ids(user_id);
+        let orig_edges = original.get_following_ids(*user_id);
+        let rec_edges = recovered.get_following_ids(*user_id);
 
         let mut orig_sorted = orig_edges.to_vec();
         let mut rec_sorted = rec_edges.to_vec();
