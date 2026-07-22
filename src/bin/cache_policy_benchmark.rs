@@ -1,16 +1,19 @@
 use graph_shard_lab::cache::{AdjacencyLruCache, EvictionPolicy};
+use std::collections::BTreeSet;
 use std::fs;
 
 const SHARD_COUNT: usize = 4;
 const USER_COUNT: u64 = 10_000;
 const HUB_COUNT: u64 = 100;
-const TOTAL_ACCESSES: usize = 80_000;
-const EDGES_PER_USER: u64 = 8;
+const TOTAL_QUERIES: u64 = 10_000;
+const FIRST_HOPS_PER_QUERY: usize = 8;
+const SECOND_HOPS_PER_USER: u64 = 8;
 
 const CAPACITIES_PER_SHARD: [usize; 4] = [25, 50, 100, 250];
 
 #[derive(Debug)]
 struct RunStats {
+    queries: usize,
     hits: usize,
     misses: usize,
 }
@@ -44,27 +47,45 @@ fn shard_for(user_id: u64) -> usize {
 }
 
 fn adjacency_for(user_id: u64) -> Vec<u64> {
-    (1..=EDGES_PER_USER)
-        .map(|offset| ((user_id - 1 + offset) % USER_COUNT) + 1)
+    (1..=SECOND_HOPS_PER_USER)
+        .map(|offset| {
+            1 + ((user_id
+                .wrapping_mul(31)
+                .wrapping_add(offset.wrapping_mul(17)))
+                % USER_COUNT)
+        })
         .collect()
 }
 
-fn build_access_trace() -> Vec<u64> {
-    let mut trace = Vec::with_capacity(TOTAL_ACCESSES);
+fn first_hops_for(source: u64) -> Vec<u64> {
+    let normal_user_count = USER_COUNT - HUB_COUNT;
 
-    for access_index in 0..TOTAL_ACCESSES {
-        let user_id = if access_index % 4 == 0 {
-            // Exactly 25% of accesses target the 100 hub users.
-            1 + ((access_index / 4) as u64 % HUB_COUNT)
-        } else {
-            // Remaining accesses rotate through the normal-user population.
-            HUB_COUNT + 1 + ((access_index as u64 * 17) % (USER_COUNT - HUB_COUNT))
-        };
+    let mut first_hops = Vec::with_capacity(FIRST_HOPS_PER_QUERY);
 
-        trace.push(user_id);
+    // Two of eight accesses target the hot set: 25% hub traffic.
+    first_hops.push(1 + ((source - 1) % HUB_COUNT));
+    first_hops.push(1 + ((source + 36) % HUB_COUNT));
+
+    // Six accesses target normal users.
+    for offset in 0..6_u64 {
+        let normal_user = HUB_COUNT + 1 + ((source * 97 + offset * 7_919) % normal_user_count);
+
+        first_hops.push(normal_user);
     }
 
-    trace
+    first_hops
+}
+
+fn uncached_two_hop(source: u64) -> Vec<u64> {
+    let mut result = BTreeSet::new();
+
+    for first_hop in first_hops_for(source) {
+        for second_hop in adjacency_for(first_hop) {
+            result.insert(second_hop);
+        }
+    }
+
+    result.into_iter().collect()
 }
 
 fn build_caches(
@@ -79,14 +100,41 @@ fn build_caches(
 fn warm_hubs(caches: &mut [AdjacencyLruCache]) {
     for user_id in 1..=HUB_COUNT {
         let shard_id = shard_for(user_id);
-        let adjacency = adjacency_for(user_id);
-
-        let _ = caches[shard_id].insert(user_id, adjacency);
+        let _ = caches[shard_id].insert(user_id, adjacency_for(user_id));
     }
 }
 
-fn run_trace(
-    trace: &[u64],
+fn cached_two_hop(source: u64, caches: &mut [AdjacencyLruCache]) -> (Vec<u64>, usize, usize) {
+    let mut result = BTreeSet::new();
+    let mut hits = 0;
+    let mut misses = 0;
+
+    for first_hop in first_hops_for(source) {
+        let shard_id = shard_for(first_hop);
+
+        let adjacency = match caches[shard_id].get(first_hop) {
+            Some(cached) => {
+                hits += 1;
+                cached
+            }
+
+            None => {
+                misses += 1;
+
+                let adjacency = adjacency_for(first_hop);
+                let _ = caches[shard_id].insert(first_hop, adjacency.clone());
+
+                adjacency
+            }
+        };
+
+        result.extend(adjacency);
+    }
+
+    (result.into_iter().collect(), hits, misses)
+}
+
+fn run_queries(
     capacity_per_shard: usize,
     policy: EvictionPolicy,
     warmed: bool,
@@ -97,35 +145,42 @@ fn run_trace(
         warm_hubs(&mut caches);
     }
 
-    let mut hits = 0;
-    let mut misses = 0;
+    let mut total_hits = 0;
+    let mut total_misses = 0;
 
-    for &user_id in trace {
-        let shard_id = shard_for(user_id);
-        let expected = adjacency_for(user_id);
+    for source in 1..=TOTAL_QUERIES {
+        let expected = uncached_two_hop(source);
 
-        match caches[shard_id].get(user_id) {
-            Some(cached) => {
-                if cached != expected {
-                    return Err(format!("Incorrect cached adjacency for user {user_id}"));
-                }
+        let (actual, hits, misses) = cached_two_hop(source, &mut caches);
 
-                hits += 1;
-            }
-
-            None => {
-                misses += 1;
-                let _ = caches[shard_id].insert(user_id, expected);
-            }
+        if actual != expected {
+            return Err(format!(
+                "{} returned incorrect two-hop results for source {source}",
+                policy_name(policy)
+            ));
         }
+
+        total_hits += hits;
+        total_misses += misses;
     }
 
-    Ok(RunStats { hits, misses })
+    let expected_accesses = TOTAL_QUERIES as usize * FIRST_HOPS_PER_QUERY;
+
+    if total_hits + total_misses != expected_accesses {
+        return Err(format!(
+            "Expected {expected_accesses} accesses, measured {}",
+            total_hits + total_misses
+        ));
+    }
+
+    Ok(RunStats {
+        queries: TOTAL_QUERIES as usize,
+        hits: total_hits,
+        misses: total_misses,
+    })
 }
 
 fn main() -> Result<(), String> {
-    let trace = build_access_trace();
-
     let policies = [
         EvictionPolicy::Lru,
         EvictionPolicy::Fifo,
@@ -133,8 +188,8 @@ fn main() -> Result<(), String> {
     ];
 
     let mut csv_rows = vec![
-        "policy,mode,capacity_per_shard,total_capacity,total_accesses,\
-         cache_hits,cache_misses,hit_rate_percent"
+        "policy,mode,capacity_per_shard,total_capacity,total_queries,\
+         total_accesses,cache_hits,cache_misses,hit_rate_percent"
             .replace(' ', ""),
     ];
 
@@ -148,7 +203,7 @@ fn main() -> Result<(), String> {
     for policy in policies {
         for capacity_per_shard in CAPACITIES_PER_SHARD {
             for warmed in [false, true] {
-                let stats = run_trace(&trace, capacity_per_shard, policy, warmed)?;
+                let stats = run_queries(capacity_per_shard, policy, warmed)?;
 
                 let mode = if warmed { "warmed" } else { "cold" };
                 let total_capacity = capacity_per_shard * SHARD_COUNT;
@@ -164,11 +219,12 @@ fn main() -> Result<(), String> {
                 );
 
                 csv_rows.push(format!(
-                    "{},{},{},{},{},{},{},{:.4}",
+                    "{},{},{},{},{},{},{},{},{:.4}",
                     policy_name(policy),
                     mode,
                     capacity_per_shard,
                     total_capacity,
+                    stats.queries,
                     stats.total_accesses(),
                     stats.hits,
                     stats.misses,
@@ -185,9 +241,10 @@ fn main() -> Result<(), String> {
         "results/cache_policy_benchmark.csv",
         csv_rows.join("\n") + "\n",
     )
-    .map_err(|error| format!("Failed to write benchmark CSV: {error}"))?;
+    .map_err(|error| format!("Failed to write CSV: {error}"))?;
 
     println!();
+    println!("All two-hop query results verified.");
     println!("Saved results/cache_policy_benchmark.csv");
 
     Ok(())
