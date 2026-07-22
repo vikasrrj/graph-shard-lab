@@ -164,6 +164,70 @@ This shows that concentrated graph hotspots are much more cacheable than a large
 
 ![Cold LRU cache hit rates](docs/images/cache_baseline.svg)
 
+
+## Distributed shard simulation
+
+The project includes an asynchronous distributed-shard simulation built with Tokio.
+
+Each logical shard runs in its own Tokio task and owns a separate local `Graph`. A coordinator routes users and queries to shard workers through bounded `mpsc` channels. Each request uses a `oneshot` channel for its response.
+
+```text
+Coordinator
+    |
+    | bounded command messages
+    v
++----------+  +----------+  +----------+  +----------+
+| Shard 0  |  | Shard 1  |  | Shard 2  |  | Shard 3  |
+| worker   |  | worker   |  | worker   |  | worker   |
++----------+  +----------+  +----------+  +----------+
+```
+
+## Distributed query execution
+
+Two implementations of the two-hop query are compared:
+
+Direct: sends one shard request for every first-hop user.
+Batched: groups first-hop users by owning shard and sends one batch message per shard.
+Batch requests to different shards are dispatched concurrently.
+
+For a query whose first-hop users are distributed across several shards:
+
+Direct:
+source read
+→ first-hop read
+→ first-hop read
+→ first-hop read
+→ ...
+
+Batched:
+source read
+→ concurrent batch request to each required shard
+
+Simulated network delay
+
+Shard read messages can be configured with a simulated delay. An individual read pays one delay, while a batch containing multiple adjacency-list reads also pays one delay.
+
+This models the latency advantage of reducing message round trips. It is a single-process simulation and does not represent real network transport, serialization, node failure, or separate machines.
+
+Latency benchmark
+
+Configuration:
+
+4 shard workers
+100 query sources
+3 repetitions per source
+300 samples per strategy
+2 ms simulated delay per shard read message
+Strategy	p50	p95	p99
+Direct	17,175 µs	30,037 µs	31,215 µs
+Batched	6,884 µs	7,494 µs	8,075 µs
+Reduction	59.92%	75.05%	74.13%
+
+The batched implementation reduced median latency by 59.92% and p99 latency by 74.13% in this simulated workload.
+
+
+
+
 ### Degree-based cache warming
 
 The warming experiment preloads the most-followed hubs before measured traffic begins.
