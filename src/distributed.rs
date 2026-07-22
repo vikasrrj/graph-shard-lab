@@ -1,5 +1,4 @@
-use std::collections::HashSet;
-
+use std::collections::{BTreeMap, HashSet};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::Graph;
@@ -26,6 +25,11 @@ enum ShardCommand {
     GetFollowing {
         source: u64,
         reply: oneshot::Sender<Vec<u64>>,
+    },
+
+    BatchGetFollowing {
+        sources: Vec<u64>,
+        reply: oneshot::Sender<Vec<(u64, Vec<u64>)>>,
     },
 }
 
@@ -94,6 +98,21 @@ impl ShardHandle {
             )
         })
     }
+    async fn get_following_batch(&self, sources: Vec<u64>) -> Result<Vec<(u64, Vec<u64>)>, String> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+
+        self.sender
+            .send(ShardCommand::BatchGetFollowing {
+                sources,
+                reply: reply_sender,
+            })
+            .await
+            .map_err(|_| format!("Shard worker {} has stopped", self.shard_id))?;
+
+        reply_receiver
+            .await
+            .map_err(|_| format!("Shard worker {} dropped the batch response", self.shard_id))
+    }
 }
 
 fn spawn_shard_worker(shard_id: usize, channel_capacity: usize) -> ShardHandle {
@@ -128,6 +147,19 @@ fn spawn_shard_worker(shard_id: usize, channel_capacity: usize) -> ShardHandle {
                     let adjacency_list = graph.get_following_ids(source).to_vec();
 
                     let _ = reply.send(adjacency_list);
+                }
+
+                ShardCommand::BatchGetFollowing { sources, reply } => {
+                    let adjacency_lists = sources
+                        .into_iter()
+                        .map(|source| {
+                            let adjacency_list = graph.get_following_ids(source).to_vec();
+
+                            (source, adjacency_list)
+                        })
+                        .collect();
+
+                    let _ = reply.send(adjacency_lists);
                 }
             }
         }
@@ -257,6 +289,55 @@ impl DistributedShardedGraph {
             shard_requests,
         })
     }
+
+    pub async fn get_two_hop_batched(&self, source: u64) -> Result<DistributedQueryResult, String> {
+        let first_hops = self.get_following_ids(source).await?;
+
+        /*
+        Group first-hop users by owning shard.
+
+        Each group becomes one actual channel message.
+        */
+        let mut batches: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
+
+        for first_hop in first_hops {
+            let shard_id = self
+                .shard_for(first_hop)
+                .ok_or_else(|| format!("Cannot find shard for user {first_hop}"))?;
+
+            batches.entry(shard_id).or_default().push(first_hop);
+        }
+
+        let mut user_ids = Vec::new();
+        let mut seen_users = HashSet::new();
+
+        /*
+        One message reads the source adjacency list.
+
+        After that, one batch message is sent to each distinct
+        shard containing first-hop users.
+        */
+        let shard_requests = 1 + batches.len();
+
+        for (shard_id, sources) in batches {
+            let adjacency_lists = self.workers[shard_id].get_following_batch(sources).await?;
+
+            for (_first_hop, second_hops) in adjacency_lists {
+                for second_hop in second_hops {
+                    if second_hop != source && seen_users.insert(second_hop) {
+                        user_ids.push(second_hop);
+                    }
+                }
+            }
+        }
+
+        user_ids.sort_unstable();
+
+        Ok(DistributedQueryResult {
+            user_ids,
+            shard_requests,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -286,6 +367,42 @@ mod tests {
         first-hop user: Users 2 and 3.
         */
         assert_eq!(result.shard_requests, 3);
+    }
+
+    #[tokio::test]
+    async fn batched_query_sends_one_message_per_target_shard() {
+        let mut graph = DistributedShardedGraph::new(3, 32).unwrap();
+
+        for id in 1..=10 {
+            graph.add_user(id, &format!("user-{id}")).await.unwrap();
+        }
+
+        /*
+        Users 2 and 5 belong to Shard 2.
+        Users 3 and 6 belong to Shard 0.
+        */
+        graph.add_follow(1, 2).await.unwrap();
+        graph.add_follow(1, 5).await.unwrap();
+        graph.add_follow(1, 3).await.unwrap();
+        graph.add_follow(1, 6).await.unwrap();
+
+        graph.add_follow(2, 7).await.unwrap();
+        graph.add_follow(5, 8).await.unwrap();
+        graph.add_follow(3, 9).await.unwrap();
+        graph.add_follow(6, 10).await.unwrap();
+
+        let direct = graph.get_two_hop(1).await.unwrap();
+
+        let batched = graph.get_two_hop_batched(1).await.unwrap();
+
+        assert_eq!(direct.user_ids, vec![7, 8, 9, 10]);
+        assert_eq!(batched.user_ids, direct.user_ids);
+
+        // Source request plus four individual first-hop requests.
+        assert_eq!(direct.shard_requests, 5);
+
+        // Source request plus one message to each of two shards.
+        assert_eq!(batched.shard_requests, 3);
     }
 
     #[tokio::test]
