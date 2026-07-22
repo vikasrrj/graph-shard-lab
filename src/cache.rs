@@ -1,5 +1,6 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::mem::size_of;
+use std::sync::Arc;
 
 /// A lightweight LRU simulator.
 ///
@@ -80,10 +81,12 @@ pub enum EvictionPolicy {
     Lfu,
 }
 
+type LfuKey = (u64, u64, u64, usize);
+
 #[derive(Debug)]
 struct CacheNode {
     user_id: u64,
-    adjacency_list: Vec<u64>,
+    adjacency_list: Arc<[u64]>,
     estimated_size_bytes: usize,
 
     frequency: u64,
@@ -102,6 +105,10 @@ pub struct AdjacencyLruCache {
     current_bytes: usize,
     policy: EvictionPolicy,
     sequence: u64,
+
+    // Ordered by frequency, recency, insertion order, then node index.
+    // The first entry is the current LFU eviction candidate.
+    lfu_index: BTreeSet<LfuKey>,
 
     locations: HashMap<u64, usize>,
     nodes: Vec<Option<CacheNode>>,
@@ -158,6 +165,7 @@ impl AdjacencyLruCache {
             current_bytes: 0,
             policy,
             sequence: 0,
+            lfu_index: BTreeSet::new(),
             locations: HashMap::with_capacity(capacity),
             nodes: Vec::with_capacity(capacity),
             free_indices: Vec::new(),
@@ -181,6 +189,17 @@ impl AdjacencyLruCache {
             Some(limit) => self.current_bytes.saturating_add(additional_bytes) > limit,
             None => false,
         }
+    }
+
+    fn lfu_key(&self, index: usize) -> LfuKey {
+        let node = self.nodes[index].as_ref().expect("Cache node must exist");
+
+        (
+            node.frequency,
+            node.last_accessed_at,
+            node.inserted_at,
+            index,
+        )
     }
 
     fn detach(&mut self, index: usize) {
@@ -248,7 +267,7 @@ impl AdjacencyLruCache {
     fn allocate_node(
         &mut self,
         user_id: u64,
-        adjacency_list: Vec<u64>,
+        adjacency_list: Arc<[u64]>,
         estimated_size_bytes: usize,
     ) -> usize {
         let sequence = self.next_sequence();
@@ -282,6 +301,10 @@ impl AdjacencyLruCache {
 
         self.attach_as_most_recent(index);
 
+        if self.policy == EvictionPolicy::Lfu {
+            self.lfu_index.insert(self.lfu_key(index));
+        }
+
         index
     }
 
@@ -291,6 +314,11 @@ impl AdjacencyLruCache {
 
             (node.user_id, node.estimated_size_bytes)
         };
+
+        if self.policy == EvictionPolicy::Lfu {
+            let removed = self.lfu_index.remove(&self.lfu_key(index));
+            debug_assert!(removed, "LFU node must exist in the ordered index");
+        }
 
         self.detach(index);
         self.locations.remove(&user_id);
@@ -302,9 +330,19 @@ impl AdjacencyLruCache {
     }
 
     pub fn get(&mut self, user_id: u64) -> Option<Vec<u64>> {
+        self.get_shared(user_id)
+            .map(|adjacency_list| adjacency_list.as_ref().to_vec())
+    }
+
+    pub fn get_shared(&mut self, user_id: u64) -> Option<Arc<[u64]>> {
         let index = self.locations.get(&user_id).copied()?;
 
-        let adjacency_list = self.nodes[index].as_ref()?.adjacency_list.clone();
+        let adjacency_list = Arc::clone(&self.nodes[index].as_ref()?.adjacency_list);
+
+        if self.policy == EvictionPolicy::Lfu {
+            let removed = self.lfu_index.remove(&self.lfu_key(index));
+            debug_assert!(removed, "LFU node must exist in the ordered index");
+        }
 
         let sequence = self.next_sequence();
 
@@ -315,9 +353,17 @@ impl AdjacencyLruCache {
             node.last_accessed_at = sequence;
         }
 
-        if self.policy == EvictionPolicy::Lru {
-            self.detach(index);
-            self.attach_as_most_recent(index);
+        match self.policy {
+            EvictionPolicy::Lru => {
+                self.detach(index);
+                self.attach_as_most_recent(index);
+            }
+
+            EvictionPolicy::Lfu => {
+                self.lfu_index.insert(self.lfu_key(index));
+            }
+
+            EvictionPolicy::Fifo => {}
         }
 
         Some(adjacency_list)
@@ -330,34 +376,32 @@ impl AdjacencyLruCache {
             }
 
             EvictionPolicy::Lfu => self
-                .locations
-                .values()
-                .copied()
-                .min_by_key(|index| {
-                    let node = self.nodes[*index].as_ref().expect("Cache node must exist");
-
-                    (node.frequency, node.last_accessed_at, node.inserted_at)
-                })
+                .lfu_index
+                .first()
+                .map(|(_, _, _, index)| *index)
                 .expect("Non-empty cache must contain an LFU candidate"),
         }
     }
 
     pub fn insert(&mut self, user_id: u64, adjacency_list: Vec<u64>) {
+        let _ = self.insert_shared(user_id, adjacency_list);
+    }
+
+    pub fn insert_shared(&mut self, user_id: u64, adjacency_list: Vec<u64>) -> Arc<[u64]> {
         let estimated_size_bytes = Self::estimate_entry_size(&adjacency_list);
 
-        // Remove the old version before inserting its replacement.
+        let adjacency_list: Arc<[u64]> = adjacency_list.into();
+
         if let Some(index) = self.locations.get(&user_id).copied() {
             self.remove_node(index);
         }
 
-        // An individual entry larger than the total limit cannot be cached.
         if let Some(byte_capacity) = self.byte_capacity {
             if estimated_size_bytes > byte_capacity {
-                return;
+                return adjacency_list;
             }
         }
 
-        // Evict LRU entries until both limits allow this insertion.
         while self.locations.len() >= self.capacity
             || self.would_exceed_byte_capacity(estimated_size_bytes)
         {
@@ -365,7 +409,9 @@ impl AdjacencyLruCache {
             self.remove_node(victim);
         }
 
-        self.allocate_node(user_id, adjacency_list, estimated_size_bytes);
+        self.allocate_node(user_id, Arc::clone(&adjacency_list), estimated_size_bytes);
+
+        adjacency_list
     }
 
     pub fn invalidate(&mut self, user_id: u64) -> bool {
@@ -696,5 +742,50 @@ mod tests {
 
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.get(10), Some(vec![3, 4]));
+    }
+
+    #[test]
+    fn lfu_index_stays_synchronized() {
+        let mut cache = AdjacencyLruCache::new_with_policy(3, EvictionPolicy::Lfu).unwrap();
+
+        cache.insert(1, vec![10]);
+        cache.insert(2, vec![20]);
+        cache.insert(3, vec![30]);
+
+        assert_eq!(cache.lfu_index.len(), cache.len());
+
+        assert_eq!(cache.get(1), Some(vec![10]));
+        assert_eq!(cache.lfu_index.len(), cache.len());
+
+        // Users 2 and 3 both have frequency one. User 2 is older,
+        // so inserting User 4 should evict User 2.
+        cache.insert(4, vec![40]);
+
+        assert!(!cache.contains(2));
+        assert!(cache.contains(1));
+        assert!(cache.contains(3));
+        assert!(cache.contains(4));
+        assert_eq!(cache.lfu_index.len(), cache.len());
+
+        assert!(cache.invalidate(3));
+        assert_eq!(cache.lfu_index.len(), cache.len());
+
+        cache.clear();
+
+        assert!(cache.is_empty());
+        assert!(cache.lfu_index.is_empty());
+    }
+
+    #[test]
+    fn shared_get_reuses_adjacency_allocation() {
+        let mut cache = AdjacencyLruCache::new(2).unwrap();
+
+        cache.insert(1, vec![10, 20, 30]);
+
+        let first = cache.get_shared(1).unwrap();
+        let second = cache.get_shared(1).unwrap();
+
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(first.as_ref(), &[10, 20, 30]);
     }
 }

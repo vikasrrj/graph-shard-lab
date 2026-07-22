@@ -635,7 +635,7 @@ impl ShardedGraph {
             let cached_adjacency_list = {
                 let caches = self.caches.as_mut().expect("Caching was checked above");
 
-                caches[first_hop_shard].get(first_hop)
+                caches[first_hop_shard].get_shared(first_hop)
             };
 
             let second_hops = match cached_adjacency_list {
@@ -654,14 +654,12 @@ impl ShardedGraph {
                     {
                         let caches = self.caches.as_mut().expect("Caching was checked above");
 
-                        caches[first_hop_shard].insert(first_hop, adjacency_list.clone());
+                        caches[first_hop_shard].insert_shared(first_hop, adjacency_list)
                     }
-
-                    adjacency_list
                 }
             };
 
-            for second_hop in second_hops {
+            for &second_hop in second_hops.iter() {
                 let Some(second_hop_shard) = self.try_shard_for(second_hop) else {
                     continue;
                 };
