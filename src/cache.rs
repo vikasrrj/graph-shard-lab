@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::mem::size_of;
 
 /// A lightweight LRU simulator.
 ///
@@ -76,43 +77,51 @@ impl IdLruSimulator {
 struct CacheNode {
     user_id: u64,
     adjacency_list: Vec<u64>,
+    estimated_size_bytes: usize,
     previous: Option<usize>,
     next: Option<usize>,
 }
 
-/// A real adjacency-list LRU cache.
-///
-/// Each entry stores:
-///
-/// user ID -> IDs of users that user follows
+/// A shard-local adjacency-list LRU cache.
 #[derive(Debug)]
 pub struct AdjacencyLruCache {
     capacity: usize,
+    byte_capacity: Option<usize>,
+    current_bytes: usize,
 
-    // Finds a cached user without scanning every entry.
     locations: HashMap<u64, usize>,
-
-    // Nodes form a doubly linked usage-order list.
     nodes: Vec<Option<CacheNode>>,
-
-    // Empty node positions that can be reused.
     free_indices: Vec<usize>,
 
-    // Least recently used entry.
+    // Least recently used.
     head: Option<usize>,
 
-    // Most recently used entry.
+    // Most recently used.
     tail: Option<usize>,
 }
 
 impl AdjacencyLruCache {
     pub fn new(capacity: usize) -> Result<Self, String> {
+        Self::build(capacity, None)
+    }
+
+    pub fn new_with_byte_capacity(capacity: usize, byte_capacity: usize) -> Result<Self, String> {
+        if byte_capacity == 0 {
+            return Err("Cache byte capacity must be greater than zero".to_string());
+        }
+
+        Self::build(capacity, Some(byte_capacity))
+    }
+
+    fn build(capacity: usize, byte_capacity: Option<usize>) -> Result<Self, String> {
         if capacity == 0 {
             return Err("Cache capacity must be greater than zero".to_string());
         }
 
         Ok(Self {
             capacity,
+            byte_capacity,
+            current_bytes: 0,
             locations: HashMap::with_capacity(capacity),
             nodes: Vec::with_capacity(capacity),
             free_indices: Vec::new(),
@@ -121,7 +130,17 @@ impl AdjacencyLruCache {
         })
     }
 
-    /// Removes a node from its current position in the LRU order.
+    fn estimate_entry_size(adjacency_list: &[u64]) -> usize {
+        size_of::<CacheNode>().saturating_add(adjacency_list.len().saturating_mul(size_of::<u64>()))
+    }
+
+    fn would_exceed_byte_capacity(&self, additional_bytes: usize) -> bool {
+        match self.byte_capacity {
+            Some(limit) => self.current_bytes.saturating_add(additional_bytes) > limit,
+            None => false,
+        }
+    }
+
     fn detach(&mut self, index: usize) {
         let (previous, next) = {
             let node = self.nodes[index].as_ref().expect("Cache node must exist");
@@ -136,9 +155,7 @@ impl AdjacencyLruCache {
                     .expect("Previous cache node must exist")
                     .next = next;
             }
-
             None => {
-                // This node was the least recently used entry.
                 self.head = next;
             }
         }
@@ -150,9 +167,7 @@ impl AdjacencyLruCache {
                     .expect("Next cache node must exist")
                     .previous = previous;
             }
-
             None => {
-                // This node was the most recently used entry.
                 self.tail = previous;
             }
         }
@@ -163,7 +178,6 @@ impl AdjacencyLruCache {
         node.next = None;
     }
 
-    /// Places a node at the most-recently-used end.
     fn attach_as_most_recent(&mut self, index: usize) {
         let previous_tail = self.tail;
 
@@ -181,9 +195,7 @@ impl AdjacencyLruCache {
                     .expect("Tail cache node must exist")
                     .next = Some(index);
             }
-
             None => {
-                // The cache was empty, so this is also the head.
                 self.head = Some(index);
             }
         }
@@ -191,11 +203,16 @@ impl AdjacencyLruCache {
         self.tail = Some(index);
     }
 
-    /// Creates a new node, reusing a deleted slot when possible.
-    fn allocate_node(&mut self, user_id: u64, adjacency_list: Vec<u64>) -> usize {
+    fn allocate_node(
+        &mut self,
+        user_id: u64,
+        adjacency_list: Vec<u64>,
+        estimated_size_bytes: usize,
+    ) -> usize {
         let node = CacheNode {
             user_id,
             adjacency_list,
+            estimated_size_bytes,
             previous: None,
             next: None,
         };
@@ -205,7 +222,6 @@ impl AdjacencyLruCache {
                 self.nodes[index] = Some(node);
                 index
             }
-
             None => {
                 self.nodes.push(Some(node));
                 self.nodes.len() - 1
@@ -213,28 +229,30 @@ impl AdjacencyLruCache {
         };
 
         self.locations.insert(user_id, index);
+
+        self.current_bytes = self.current_bytes.saturating_add(estimated_size_bytes);
+
         self.attach_as_most_recent(index);
 
         index
     }
 
-    /// Completely removes a node from the cache.
     fn remove_node(&mut self, index: usize) {
-        let user_id = self.nodes[index]
-            .as_ref()
-            .expect("Cache node must exist")
-            .user_id;
+        let (user_id, estimated_size_bytes) = {
+            let node = self.nodes[index].as_ref().expect("Cache node must exist");
+
+            (node.user_id, node.estimated_size_bytes)
+        };
 
         self.detach(index);
         self.locations.remove(&user_id);
+
+        self.current_bytes = self.current_bytes.saturating_sub(estimated_size_bytes);
 
         self.nodes[index] = None;
         self.free_indices.push(index);
     }
 
-    /// Returns the cached adjacency list.
-    ///
-    /// Reading an entry also makes it the most recently used entry.
     pub fn get(&mut self, user_id: u64) -> Option<Vec<u64>> {
         let index = self.locations.get(&user_id).copied()?;
 
@@ -246,30 +264,35 @@ impl AdjacencyLruCache {
         Some(adjacency_list)
     }
 
-    /// Inserts or replaces one user's adjacency list.
     pub fn insert(&mut self, user_id: u64, adjacency_list: Vec<u64>) {
+        let estimated_size_bytes = Self::estimate_entry_size(&adjacency_list);
+
+        // Remove the old version before inserting its replacement.
         if let Some(index) = self.locations.get(&user_id).copied() {
-            self.nodes[index]
-                .as_mut()
-                .expect("Cache node must exist")
-                .adjacency_list = adjacency_list;
-
-            self.detach(index);
-            self.attach_as_most_recent(index);
-
-            return;
+            self.remove_node(index);
         }
 
-        if self.locations.len() == self.capacity {
-            let least_recently_used = self.head.expect("A full cache must contain a head node");
+        // An individual entry larger than the total limit cannot be cached.
+        if let Some(byte_capacity) = self.byte_capacity {
+            if estimated_size_bytes > byte_capacity {
+                return;
+            }
+        }
+
+        // Evict LRU entries until both limits allow this insertion.
+        while self.locations.len() >= self.capacity
+            || self.would_exceed_byte_capacity(estimated_size_bytes)
+        {
+            let least_recently_used = self
+                .head
+                .expect("Cache requiring eviction must contain a head");
 
             self.remove_node(least_recently_used);
         }
 
-        self.allocate_node(user_id, adjacency_list);
+        self.allocate_node(user_id, adjacency_list, estimated_size_bytes);
     }
 
-    /// Removes one user's cached adjacency list.
     pub fn invalidate(&mut self, user_id: u64) -> bool {
         let Some(index) = self.locations.get(&user_id).copied() else {
             return false;
@@ -292,11 +315,18 @@ impl AdjacencyLruCache {
         self.locations.is_empty()
     }
 
+    pub fn current_bytes(&self) -> usize {
+        self.current_bytes
+    }
+
+    pub fn byte_capacity(&self) -> Option<usize> {
+        self.byte_capacity
+    }
+
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +337,51 @@ mod tests {
 
         assert!(!cache.access(10));
         assert!(cache.access(10));
+    }
+
+    #[test]
+    fn byte_bounded_cache_evicts_lru_entry() {
+        let entry_size = AdjacencyLruCache::estimate_entry_size(&[10]);
+
+        let mut cache = AdjacencyLruCache::new_with_byte_capacity(10, entry_size * 2).unwrap();
+
+        cache.insert(1, vec![10]);
+        cache.insert(2, vec![20]);
+        cache.insert(3, vec![30]);
+
+        assert!(!cache.contains(1));
+        assert!(cache.contains(2));
+        assert!(cache.contains(3));
+        assert_eq!(cache.len(), 2);
+        assert!(cache.current_bytes() <= entry_size * 2);
+    }
+
+    #[test]
+    fn oversized_entry_is_not_cached() {
+        let byte_limit = AdjacencyLruCache::estimate_entry_size(&[10]);
+
+        let mut cache = AdjacencyLruCache::new_with_byte_capacity(10, byte_limit).unwrap();
+
+        cache.insert(1, vec![10, 20, 30, 40]);
+
+        assert!(!cache.contains(1));
+        assert_eq!(cache.current_bytes(), 0);
+    }
+
+    #[test]
+    fn replacing_entry_updates_byte_accounting() {
+        let large_adjacency = vec![10, 20, 30, 40];
+
+        let large_size = AdjacencyLruCache::estimate_entry_size(&large_adjacency);
+
+        let mut cache = AdjacencyLruCache::new_with_byte_capacity(10, large_size).unwrap();
+
+        cache.insert(1, vec![10]);
+        cache.insert(1, large_adjacency);
+
+        assert!(cache.contains(1));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.current_bytes(), large_size);
     }
 
     #[test]
