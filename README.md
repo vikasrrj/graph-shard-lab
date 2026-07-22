@@ -488,32 +488,20 @@ graph-shard-lab/
 
 ## Limitations
 
-GraphShard Lab is a research prototype, not a production distributed database.
+GraphShard Lab is a research prototype rather than a production distributed database.
 
-- All shards and shard-local caches run inside one process.
-- Data is stored only in memory and is not persisted to disk.
-- Cross-shard hops and shard requests are logical measurements — no real network communication occurs, and real latency/throughput are not measured.
-- Community membership is supplied in advance; oversized communities are not split.
-- Nodes are not replicated, and there is no failover or replication protocol.
+- Shards run inside a single process.
+- Data is stored in memory.
+- Network behavior is simulated.
 - Workloads are synthetic.
-- Cache capacity counts adjacency-list entries rather than memory bytes.
-- Cached adjacency lists are cloned when returned.
-- Cache warming uses complete workload degree information, which is an idealized assumption.
-- Cache-hit improvements are not equivalent to measured latency improvements.
+- Replication and recovery are not implemented.
 
 ## Future work
 
-Possible extensions include:
-
-- Comparing LRU with LFU and other eviction policies
-- Warming caches using observed traffic rather than complete workload knowledge
+- Cache-policy benchmarks
 - Hot-node replication
 - Dynamic shard rebalancing
-- Oversized-community splitting
-- Persistent storage
-- Cache invalidation when edges are added or removed
-- Byte-bounded caches instead of entry-count limits
-- A more efficient constant-time LRU implementation
+- Persistent storage and recovery
 
 ## Conclusion
 
