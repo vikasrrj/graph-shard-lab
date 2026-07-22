@@ -94,6 +94,19 @@ impl ShardedGraph {
         Self::with_placement_and_cache(shard_count, Placement::Hash, cache_capacity_per_shard)
     }
 
+    pub fn new_with_byte_bounded_cache(
+        shard_count: usize,
+        cache_capacity_per_shard: usize,
+        cache_byte_capacity_per_shard: usize,
+    ) -> Result<Self, String> {
+        Self::with_placement_and_byte_bounded_cache(
+            shard_count,
+            Placement::Hash,
+            cache_capacity_per_shard,
+            cache_byte_capacity_per_shard,
+        )
+    }
+
     /*
     This constructor calculates the balanced community assignment
     and then creates the sharded graph using that assignment.
@@ -174,12 +187,6 @@ impl ShardedGraph {
         placement: Placement,
         cache_capacity_per_shard: usize,
     ) -> Result<Self, String> {
-        /*
-        First use the existing constructor.
-
-        This reuses all current validation for shard count
-        and placement configuration.
-        */
         let mut graph = Self::with_placement(shard_count, placement)?;
 
         let mut caches = Vec::with_capacity(shard_count);
@@ -193,10 +200,27 @@ impl ShardedGraph {
         Ok(graph)
     }
 
-    /*
-    Returns None when the user ID is invalid or falls outside the
-    configured balanced-community ranges.
-    */
+    pub fn with_placement_and_byte_bounded_cache(
+        shard_count: usize,
+        placement: Placement,
+        cache_capacity_per_shard: usize,
+        cache_byte_capacity_per_shard: usize,
+    ) -> Result<Self, String> {
+        let mut graph = Self::with_placement(shard_count, placement)?;
+
+        let mut caches = Vec::with_capacity(shard_count);
+
+        for _ in 0..shard_count {
+            caches.push(AdjacencyLruCache::new_with_byte_capacity(
+                cache_capacity_per_shard,
+                cache_byte_capacity_per_shard,
+            )?);
+        }
+
+        graph.caches = Some(caches);
+
+        Ok(graph)
+    }
     fn try_shard_for(&self, user_id: u64) -> Option<usize> {
         if user_id == 0 {
             return None;
@@ -589,6 +613,52 @@ mod tests {
         }
 
         assert_eq!(graph.users_per_shard(), vec![2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn creates_byte_bounded_cache_for_every_shard() {
+        let graph = ShardedGraph::new_with_byte_bounded_cache(4, 100, 4096).unwrap();
+
+        let caches = graph.caches.as_ref().unwrap();
+
+        assert_eq!(caches.len(), 4);
+
+        for cache in caches {
+            assert_eq!(cache.capacity(), 100);
+            assert_eq!(cache.byte_capacity(), Some(4096));
+            assert_eq!(cache.current_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn byte_bounded_cache_rejects_zero_byte_capacity() {
+        assert!(ShardedGraph::new_with_byte_bounded_cache(4, 100, 0).is_err());
+    }
+
+    #[test]
+    fn oversized_adjacency_is_not_cached_by_sharded_graph() {
+        let mut graph = ShardedGraph::new_with_byte_bounded_cache(2, 10, 1).unwrap();
+
+        graph.add_user(1, "Alice").unwrap();
+        graph.add_user(2, "Bob").unwrap();
+        graph.add_user(3, "Charlie").unwrap();
+
+        graph.add_follow(1, 2).unwrap();
+        graph.add_follow(2, 3).unwrap();
+
+        let first = graph.get_two_hop_with_cache_stats(1).unwrap();
+
+        assert_eq!(first.user_ids, vec![3]);
+        assert_eq!(first.cache_hits, 0);
+        assert_eq!(first.cache_misses, 1);
+
+        // The adjacency list cannot fit into a one-byte cache,
+        // so the second query must miss again.
+        let second = graph.get_two_hop_with_cache_stats(1).unwrap();
+
+        assert_eq!(second.user_ids, vec![3]);
+        assert_eq!(second.cache_hits, 0);
+        assert_eq!(second.cache_misses, 1);
     }
 
     #[test]
