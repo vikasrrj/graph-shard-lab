@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 /// A lightweight LRU simulator.
 ///
@@ -70,10 +70,39 @@ impl IdLruSimulator {
 /// Each entry stores:
 ///
 /// user ID -> IDs of users that user follows
+///
+
+#[derive(Debug)]
+struct CacheNode {
+    user_id: u64,
+    adjacency_list: Vec<u64>,
+    previous: Option<usize>,
+    next: Option<usize>,
+}
+
+/// A real adjacency-list LRU cache.
+///
+/// Each entry stores:
+///
+/// user ID -> IDs of users that user follows
 #[derive(Debug)]
 pub struct AdjacencyLruCache {
     capacity: usize,
-    entries: VecDeque<(u64, Vec<u64>)>,
+
+    // Finds a cached user without scanning every entry.
+    locations: HashMap<u64, usize>,
+
+    // Nodes form a doubly linked usage-order list.
+    nodes: Vec<Option<CacheNode>>,
+
+    // Empty node positions that can be reused.
+    free_indices: Vec<usize>,
+
+    // Least recently used entry.
+    head: Option<usize>,
+
+    // Most recently used entry.
+    tail: Option<usize>,
 }
 
 impl AdjacencyLruCache {
@@ -84,79 +113,183 @@ impl AdjacencyLruCache {
 
         Ok(Self {
             capacity,
-            entries: VecDeque::with_capacity(capacity),
+            locations: HashMap::with_capacity(capacity),
+            nodes: Vec::with_capacity(capacity),
+            free_indices: Vec::new(),
+            head: None,
+            tail: None,
         })
+    }
+
+    /// Removes a node from its current position in the LRU order.
+    fn detach(&mut self, index: usize) {
+        let (previous, next) = {
+            let node = self.nodes[index].as_ref().expect("Cache node must exist");
+
+            (node.previous, node.next)
+        };
+
+        match previous {
+            Some(previous_index) => {
+                self.nodes[previous_index]
+                    .as_mut()
+                    .expect("Previous cache node must exist")
+                    .next = next;
+            }
+
+            None => {
+                // This node was the least recently used entry.
+                self.head = next;
+            }
+        }
+
+        match next {
+            Some(next_index) => {
+                self.nodes[next_index]
+                    .as_mut()
+                    .expect("Next cache node must exist")
+                    .previous = previous;
+            }
+
+            None => {
+                // This node was the most recently used entry.
+                self.tail = previous;
+            }
+        }
+
+        let node = self.nodes[index].as_mut().expect("Cache node must exist");
+
+        node.previous = None;
+        node.next = None;
+    }
+
+    /// Places a node at the most-recently-used end.
+    fn attach_as_most_recent(&mut self, index: usize) {
+        let previous_tail = self.tail;
+
+        {
+            let node = self.nodes[index].as_mut().expect("Cache node must exist");
+
+            node.previous = previous_tail;
+            node.next = None;
+        }
+
+        match previous_tail {
+            Some(tail_index) => {
+                self.nodes[tail_index]
+                    .as_mut()
+                    .expect("Tail cache node must exist")
+                    .next = Some(index);
+            }
+
+            None => {
+                // The cache was empty, so this is also the head.
+                self.head = Some(index);
+            }
+        }
+
+        self.tail = Some(index);
+    }
+
+    /// Creates a new node, reusing a deleted slot when possible.
+    fn allocate_node(&mut self, user_id: u64, adjacency_list: Vec<u64>) -> usize {
+        let node = CacheNode {
+            user_id,
+            adjacency_list,
+            previous: None,
+            next: None,
+        };
+
+        let index = match self.free_indices.pop() {
+            Some(index) => {
+                self.nodes[index] = Some(node);
+                index
+            }
+
+            None => {
+                self.nodes.push(Some(node));
+                self.nodes.len() - 1
+            }
+        };
+
+        self.locations.insert(user_id, index);
+        self.attach_as_most_recent(index);
+
+        index
+    }
+
+    /// Completely removes a node from the cache.
+    fn remove_node(&mut self, index: usize) {
+        let user_id = self.nodes[index]
+            .as_ref()
+            .expect("Cache node must exist")
+            .user_id;
+
+        self.detach(index);
+        self.locations.remove(&user_id);
+
+        self.nodes[index] = None;
+        self.free_indices.push(index);
     }
 
     /// Returns the cached adjacency list.
     ///
     /// Reading an entry also makes it the most recently used entry.
     pub fn get(&mut self, user_id: u64) -> Option<Vec<u64>> {
-        let position = self
-            .entries
-            .iter()
-            .position(|(cached_id, _)| *cached_id == user_id)?;
+        let index = self.locations.get(&user_id).copied()?;
 
-        let (cached_id, adjacency_list) = self.entries.remove(position)?;
+        let adjacency_list = self.nodes[index].as_ref()?.adjacency_list.clone();
 
-        // We return a copy because the original value must remain in the cache.
-        let result = adjacency_list.clone();
+        self.detach(index);
+        self.attach_as_most_recent(index);
 
-        // Move the entry to the most-recently-used position.
-        self.entries.push_back((cached_id, adjacency_list));
-
-        Some(result)
+        Some(adjacency_list)
     }
 
     /// Inserts or replaces one user's adjacency list.
     pub fn insert(&mut self, user_id: u64, adjacency_list: Vec<u64>) {
-        // Remove an older copy when this user is already cached.
-        if let Some(position) = self
-            .entries
-            .iter()
-            .position(|(cached_id, _)| *cached_id == user_id)
-        {
-            self.entries.remove(position);
+        if let Some(index) = self.locations.get(&user_id).copied() {
+            self.nodes[index]
+                .as_mut()
+                .expect("Cache node must exist")
+                .adjacency_list = adjacency_list;
+
+            self.detach(index);
+            self.attach_as_most_recent(index);
+
+            return;
         }
 
-        // Remove the least-recently-used entry when full.
-        if self.entries.len() == self.capacity {
-            self.entries.pop_front();
+        if self.locations.len() == self.capacity {
+            let least_recently_used = self.head.expect("A full cache must contain a head node");
+
+            self.remove_node(least_recently_used);
         }
 
-        self.entries.push_back((user_id, adjacency_list));
+        self.allocate_node(user_id, adjacency_list);
     }
 
     /// Removes one user's cached adjacency list.
-    ///
-    /// Returns true when an entry existed and was removed.
-    /// Returns false when the user was not cached.
     pub fn invalidate(&mut self, user_id: u64) -> bool {
-        let Some(position) = self
-            .entries
-            .iter()
-            .position(|(cached_id, _)| *cached_id == user_id)
-        else {
+        let Some(index) = self.locations.get(&user_id).copied() else {
             return false;
         };
 
-        self.entries.remove(position);
+        self.remove_node(index);
 
         true
     }
 
     pub fn contains(&self, user_id: u64) -> bool {
-        self.entries
-            .iter()
-            .any(|(cached_id, _)| *cached_id == user_id)
+        self.locations.contains_key(&user_id)
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.locations.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.locations.is_empty()
     }
 
     pub fn capacity(&self) -> usize {
@@ -174,6 +307,29 @@ mod tests {
 
         assert!(!cache.access(10));
         assert!(cache.access(10));
+    }
+
+    #[test]
+    fn adjacency_cache_hit_moves_entry_to_most_recent() {
+        let mut cache = AdjacencyLruCache::new(3).unwrap();
+
+        cache.insert(1, vec![10]);
+        cache.insert(2, vec![20]);
+        cache.insert(3, vec![30]);
+
+        // Order is now: 1, 2, 3.
+        // Reading 1 should move it to the most-recent end:
+        // 2, 3, 1.
+        assert_eq!(cache.get(1), Some(vec![10]));
+
+        // Cache is full, so inserting 4 should evict User 2.
+        cache.insert(4, vec![40]);
+
+        assert!(cache.contains(1));
+        assert!(!cache.contains(2));
+        assert!(cache.contains(3));
+        assert!(cache.contains(4));
+        assert_eq!(cache.len(), 3);
     }
 
     #[test]
