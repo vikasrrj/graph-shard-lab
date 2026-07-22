@@ -1,6 +1,7 @@
+use crate::cache::{AdjacencyLruCache, EvictionPolicy};
 use std::collections::{BTreeMap, HashSet};
 
-use crate::{Graph, User, balanced::assign_communities_balanced, cache::AdjacencyLruCache};
+use crate::{Graph, User, balanced::assign_communities_balanced};
 #[derive(Debug, Clone)]
 pub enum Placement {
     Hash,
@@ -105,6 +106,80 @@ impl ShardedGraph {
             cache_capacity_per_shard,
             cache_byte_capacity_per_shard,
         )
+    }
+
+    pub fn new_with_cache_policy(
+        shard_count: usize,
+        cache_capacity_per_shard: usize,
+        policy: EvictionPolicy,
+    ) -> Result<Self, String> {
+        Self::with_placement_and_cache_policy(
+            shard_count,
+            Placement::Hash,
+            cache_capacity_per_shard,
+            policy,
+        )
+    }
+
+    pub fn new_with_policy_and_byte_bounded_cache(
+        shard_count: usize,
+        cache_capacity_per_shard: usize,
+        cache_byte_capacity_per_shard: usize,
+        policy: EvictionPolicy,
+    ) -> Result<Self, String> {
+        Self::with_placement_and_policy_and_byte_bounded_cache(
+            shard_count,
+            Placement::Hash,
+            cache_capacity_per_shard,
+            cache_byte_capacity_per_shard,
+            policy,
+        )
+    }
+
+    pub fn with_placement_and_cache_policy(
+        shard_count: usize,
+        placement: Placement,
+        cache_capacity_per_shard: usize,
+        policy: EvictionPolicy,
+    ) -> Result<Self, String> {
+        let mut graph = Self::with_placement(shard_count, placement)?;
+
+        let mut caches = Vec::with_capacity(shard_count);
+
+        for _ in 0..shard_count {
+            caches.push(AdjacencyLruCache::new_with_policy(
+                cache_capacity_per_shard,
+                policy,
+            )?);
+        }
+
+        graph.caches = Some(caches);
+
+        Ok(graph)
+    }
+
+    pub fn with_placement_and_policy_and_byte_bounded_cache(
+        shard_count: usize,
+        placement: Placement,
+        cache_capacity_per_shard: usize,
+        cache_byte_capacity_per_shard: usize,
+        policy: EvictionPolicy,
+    ) -> Result<Self, String> {
+        let mut graph = Self::with_placement(shard_count, placement)?;
+
+        let mut caches = Vec::with_capacity(shard_count);
+
+        for _ in 0..shard_count {
+            caches.push(AdjacencyLruCache::new_with_policy_and_byte_capacity(
+                cache_capacity_per_shard,
+                cache_byte_capacity_per_shard,
+                policy,
+            )?);
+        }
+
+        graph.caches = Some(caches);
+
+        Ok(graph)
     }
 
     /*
@@ -613,6 +688,39 @@ mod tests {
         }
 
         assert_eq!(graph.users_per_shard(), vec![2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn creates_requested_cache_policy_for_every_shard() {
+        let graph = ShardedGraph::new_with_cache_policy(4, 100, EvictionPolicy::Lfu).unwrap();
+
+        let caches = graph.caches.as_ref().unwrap();
+
+        assert_eq!(caches.len(), 4);
+
+        for cache in caches {
+            assert_eq!(cache.policy(), EvictionPolicy::Lfu);
+            assert_eq!(cache.capacity(), 100);
+            assert_eq!(cache.byte_capacity(), None);
+        }
+    }
+
+    #[test]
+    fn creates_policy_cache_with_byte_limit_for_every_shard() {
+        let graph =
+            ShardedGraph::new_with_policy_and_byte_bounded_cache(3, 50, 4096, EvictionPolicy::Fifo)
+                .unwrap();
+
+        let caches = graph.caches.as_ref().unwrap();
+
+        assert_eq!(caches.len(), 3);
+
+        for cache in caches {
+            assert_eq!(cache.policy(), EvictionPolicy::Fifo);
+            assert_eq!(cache.capacity(), 50);
+            assert_eq!(cache.byte_capacity(), Some(4096));
+            assert_eq!(cache.current_bytes(), 0);
+        }
     }
 
     #[test]
